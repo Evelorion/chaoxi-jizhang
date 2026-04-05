@@ -157,6 +157,14 @@ class LedgerNotificationListenerService : NotificationListenerService() {
                 "com.jingdong.app.mall",
                 "com.xunmeng.pinduoduo",
                 "com.taobao.idlefish",
+                // 六大国有银行
+                "com.icbc",
+                "com.icbc.im",
+                "com.chinamworld.main",
+                "com.android.bankabc",
+                "com.chinamworld.bocmbci",
+                "com.bankcomm.Bankcomm",
+                "com.yitong.mbank.psbc",
             )
         ) {
             return false
@@ -196,6 +204,25 @@ class LedgerNotificationListenerService : NotificationListenerService() {
             "paid",
             "received",
             "transfer",
+            // 银行通知关键词
+            "消费",
+            "消費",
+            "动账",
+            "動賬",
+            "入账",
+            "入帳",
+            "扣款",
+            "交易",
+            "尾号",
+            "尾號",
+            "余额",
+            "餘額",
+            "工资",
+            "工資",
+            "储蓄卡",
+            "信用卡",
+            "人民币",
+            "人民幣",
         )
         return keywords.any { merged.contains(it.lowercase()) }
     }

@@ -10,6 +10,7 @@ import 'package:collection/collection.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
@@ -19,6 +20,11 @@ import 'package:intl/intl.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
+
+part 'ui_extensions.dart';
+part 'ui_predict_cards.dart';
+part 'nlp_engine.dart';
+part 'ui_voice_fab.dart';
 
 const _uuid = Uuid();
 const _ledgerFileName = 'chaoxi_vault.enc';
@@ -251,6 +257,8 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
           children: [
             const _AmbientBackground(),
             SafeArea(child: _buildStateBody(context, state)),
+            if (_selectedIndex == 0 && state.book != null)
+              VoiceRecordingFab(book: state.book!, controller: ref.read(ledgerControllerProvider.notifier)),
           ],
         ),
       ),
@@ -348,6 +356,7 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
             ],
           ),
         ),
+
       ],
     );
   }
@@ -517,6 +526,13 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     );
     await _persistBook(updated, passphrase, notice: '机密设置已更新。');
     await _syncBiometricPassphrase(settings, passphrase);
+  }
+
+  Future<void> updateBook(LedgerBook book) async {
+    final passphrase = _sessionPassphrase;
+    if (passphrase == null) return;
+    final updated = book.copyWith(updatedAt: DateTime.now());
+    await _persistBook(updated, passphrase, notice: '账本规则已更新。');
   }
 
   Future<void> updateBiometricUnlockEnabled(bool enabled) async {
@@ -842,6 +858,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       return;
     }
 
+    _linkRefundBindings(workingEntries);
     final updatedBook = book.copyWith(
       entries: [...workingEntries]
         ..sort((a, b) => b.occurredAt.compareTo(a.occurredAt)),
@@ -860,10 +877,12 @@ class LedgerController extends StateNotifier<LedgerViewState> {
   }
 
   LedgerEntry _captureToEntry(AutoCaptureRecord capture, LedgerBook book) {
-    final resolvedCategoryId = inferAutoCaptureCategoryId(
+    final inferred = inferAutoCaptureCategoryId(
       book: book,
       capture: capture,
     );
+    final resolvedCategoryId = inferred.$1;
+    final customTags = inferred.$2;
     final displaySource = capture.source.isShoppingSource
         ? capture.source
         : capture.relatedSources.firstWhereOrNull(
@@ -922,6 +941,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       tags: [
         ...sourceTags,
         scenarioLabel,
+        ...customTags,
         if (capture.confidence >= 0.85) '高置信度',
       ],
       autoCaptured: true,
@@ -1129,14 +1149,14 @@ class LedgerController extends StateNotifier<LedgerViewState> {
   String _mergeLines(String left, String right) {
     return <String>{
       ...left
-          .split('\n')
+          .split('\\n')
           .map((item) => item.trim())
           .where((item) => item.isNotEmpty),
       ...right
-          .split('\n')
+          .split('\\n')
           .map((item) => item.trim())
           .where((item) => item.isNotEmpty),
-    }.join('\n');
+    }.join('\\n');
   }
 
   bool _containsSimilarAutoEntry(
@@ -1255,6 +1275,30 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         busy: false,
         errorMessage: '导入失败：请确认是潮汐账本导出的 JSON 备份。错误：$error',
       );
+    }
+  }
+
+  void _linkRefundBindings(List<LedgerEntry> entries) {
+    final linkedRefundIds = <String>{};
+    for (final e in entries) linkedRefundIds.addAll(e.linkedRefundEntryIds);
+    final refundEntries = entries.where((e) => e.type == EntryType.income && (e.tags.contains('退款') || e.tags.contains('平台退款') || e.sourceLabel.contains('退款') || e.title.contains('退款') || e.categoryId == 'refund')).toList();
+    for (final refund in refundEntries) {
+      if (linkedRefundIds.contains(refund.id)) continue;
+      final candidateIndex = entries.indexWhere((expense) {
+        if (expense.type != EntryType.expense) return false;
+        if ((expense.amount - refund.amount).abs() > 0.009) return false;
+        if (expense.occurredAt.isAfter(refund.occurredAt)) return false;
+        if (refund.occurredAt.difference(expense.occurredAt).inDays > 90) return false;
+        if (expense.merchant.isNotEmpty && expense.merchant == refund.merchant) return !expense.linkedRefundEntryIds.contains(refund.id);
+        if (expense.counterpartyName.isNotEmpty && expense.counterpartyName == refund.counterpartyName) return !expense.linkedRefundEntryIds.contains(refund.id);
+        if (expense.sourceLabel == refund.sourceLabel) return !expense.linkedRefundEntryIds.contains(refund.id);
+        return false;
+      });
+      if (candidateIndex != -1) {
+        final target = entries[candidateIndex];
+        entries[candidateIndex] = target.copyWith(linkedRefundEntryIds: [...target.linkedRefundEntryIds, refund.id]);
+        linkedRefundIds.add(refund.id);
+      }
     }
   }
 
@@ -1896,6 +1940,79 @@ String _fallbackCategoryIdForType(EntryType type) {
   return categoriesForType(type).first.id;
 }
 
+enum LocationTrackingMode { off, foregroundLazy, backgroundPrecise, ipRough }
+enum AssetType { wechat, alipay, bankCard, cash, other }
+
+class AssetAccount {
+  const AssetAccount({
+    required this.id,
+    required this.name,
+    required this.type,
+    required this.initialBalance,
+  });
+
+  final String id;
+  final String name;
+  final AssetType type;
+  final double initialBalance;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'type': type.name,
+    'initialBalance': initialBalance,
+  };
+
+  factory AssetAccount.fromJson(Map<String, dynamic> json) => AssetAccount(
+    id: json['id'] as String,
+    name: json['name'] as String,
+    type: AssetType.values.byName(json['type'] as String),
+    initialBalance: (json['initialBalance'] as num).toDouble(),
+  );
+}
+
+class CategorizationRule {
+  const CategorizationRule({
+    required this.id,
+    required this.pattern,
+    required this.categoryId,
+    required this.autoTags,
+  });
+
+  final String id;
+  final String pattern;
+  final String categoryId;
+  final List<String> autoTags;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'pattern': pattern,
+    'categoryId': categoryId,
+    'autoTags': autoTags,
+  };
+
+  factory CategorizationRule.fromJson(Map<String, dynamic> json) => CategorizationRule(
+    id: json['id'] as String,
+    pattern: json['pattern'] as String,
+    categoryId: json['categoryId'] as String,
+    autoTags: (json['autoTags'] as List<dynamic>? ?? const []).cast<String>(),
+  );
+}
+
+enum ExpenseMood {
+  none('无心情', '😐', Color(0xFF9E9E9E)),
+  angry('冲动解压', '😡', Color(0xFFF44336)),
+  happy('开心庆祝', '🎉', Color(0xFFFF9800)),
+  tired('疲惫犒劳', '☕', Color(0xFF795548)),
+  sad('emo抚慰', '🌧️', Color(0xFF2196F3)),
+  chill('平静松弛', '🧘', Color(0xFF009688));
+
+  final String label;
+  final String emoji;
+  final Color color;
+  const ExpenseMood(this.label, this.emoji, this.color);
+}
+
 class LedgerEntry {
   const LedgerEntry({
     required this.id,
@@ -1908,7 +2025,10 @@ class LedgerEntry {
     required this.categoryId,
     required this.channel,
     required this.occurredAt,
-    required this.tags,
+    this.tags = const [],
+    this.linkedRefundEntryIds = const [],
+    this.locationInfo = '',
+    this.mood = ExpenseMood.none,
     required this.autoCaptured,
     required this.sourceLabel,
     this.autoMergeKey = '',
@@ -1928,6 +2048,9 @@ class LedgerEntry {
   final PaymentChannel channel;
   final DateTime occurredAt;
   final List<String> tags;
+  final List<String> linkedRefundEntryIds;
+  final String locationInfo;
+  final ExpenseMood mood;
   final bool autoCaptured;
   final String sourceLabel;
   final String autoMergeKey;
@@ -1947,6 +2070,9 @@ class LedgerEntry {
     PaymentChannel? channel,
     DateTime? occurredAt,
     List<String>? tags,
+    List<String>? linkedRefundEntryIds,
+    String? locationInfo,
+    ExpenseMood? mood,
     bool? autoCaptured,
     String? sourceLabel,
     String? autoMergeKey,
@@ -1966,6 +2092,9 @@ class LedgerEntry {
       channel: channel ?? this.channel,
       occurredAt: occurredAt ?? this.occurredAt,
       tags: tags ?? this.tags,
+      linkedRefundEntryIds: linkedRefundEntryIds ?? this.linkedRefundEntryIds,
+      locationInfo: locationInfo ?? this.locationInfo,
+      mood: mood ?? this.mood,
       autoCaptured: autoCaptured ?? this.autoCaptured,
       sourceLabel: sourceLabel ?? this.sourceLabel,
       autoMergeKey: autoMergeKey ?? this.autoMergeKey,
@@ -1987,6 +2116,9 @@ class LedgerEntry {
     'channel': channel.name,
     'occurredAt': occurredAt.toIso8601String(),
     'tags': tags,
+    'linkedRefundEntryIds': linkedRefundEntryIds,
+    'locationInfo': locationInfo,
+    'mood': mood.name,
     'autoCaptured': autoCaptured,
     'sourceLabel': sourceLabel,
     'autoMergeKey': autoMergeKey,
@@ -2007,6 +2139,9 @@ class LedgerEntry {
     channel: PaymentChannel.values.byName(json['channel'] as String),
     occurredAt: DateTime.parse(json['occurredAt'] as String),
     tags: (json['tags'] as List<dynamic>? ?? const []).cast<String>(),
+    linkedRefundEntryIds: (json['linkedRefundEntryIds'] as List<dynamic>? ?? const []).cast<String>(),
+    locationInfo: json['locationInfo'] as String? ?? '',
+    mood: ExpenseMood.values.firstWhere((e) => e.name == json['mood'], orElse: () => ExpenseMood.none),
     autoCaptured: json['autoCaptured'] as bool? ?? false,
     sourceLabel: json['sourceLabel'] as String? ?? '',
     autoMergeKey: json['autoMergeKey'] as String? ?? '',
@@ -2175,6 +2310,7 @@ class VaultSettings {
     required this.jdEnabled,
     required this.pinduoduoEnabled,
     required this.xianyuEnabled,
+    this.locationMode = LocationTrackingMode.off,
   });
 
   final bool confidentialModeEnabled;
@@ -2191,6 +2327,7 @@ class VaultSettings {
   final bool jdEnabled;
   final bool pinduoduoEnabled;
   final bool xianyuEnabled;
+  final LocationTrackingMode locationMode;
 
   Map<String, dynamic> toJson() => {
     'confidentialModeEnabled': confidentialModeEnabled,
@@ -2207,6 +2344,7 @@ class VaultSettings {
     'jdEnabled': jdEnabled,
     'pinduoduoEnabled': pinduoduoEnabled,
     'xianyuEnabled': xianyuEnabled,
+    'locationMode': locationMode.name,
   };
 
   factory VaultSettings.fromJson(Map<String, dynamic> json) => VaultSettings(
@@ -2225,6 +2363,7 @@ class VaultSettings {
     jdEnabled: json['jdEnabled'] as bool? ?? true,
     pinduoduoEnabled: json['pinduoduoEnabled'] as bool? ?? true,
     xianyuEnabled: json['xianyuEnabled'] as bool? ?? true,
+    locationMode: LocationTrackingMode.values.firstWhere((e) => e.name == (json['locationMode'] as String?), orElse: () => LocationTrackingMode.off),
   );
 
   VaultSettings copyWith({
@@ -2242,6 +2381,7 @@ class VaultSettings {
     bool? jdEnabled,
     bool? pinduoduoEnabled,
     bool? xianyuEnabled,
+    LocationTrackingMode? locationMode,
   }) {
     return VaultSettings(
       confidentialModeEnabled:
@@ -2262,6 +2402,7 @@ class VaultSettings {
       jdEnabled: jdEnabled ?? this.jdEnabled,
       pinduoduoEnabled: pinduoduoEnabled ?? this.pinduoduoEnabled,
       xianyuEnabled: xianyuEnabled ?? this.xianyuEnabled,
+      locationMode: locationMode ?? this.locationMode,
     );
   }
 }
@@ -2276,6 +2417,8 @@ class LedgerBook {
     required this.goals,
     required this.subscriptions,
     required this.settings,
+    this.assetAccounts = const [],
+    this.customRules = const [],
   });
 
   factory LedgerBook.empty(bool confidentialModeEnabled) {
@@ -2288,7 +2431,17 @@ class LedgerBook {
       budgets: const [],
       goals: const [],
       subscriptions: const [],
+      assetAccounts: const [],
+      customRules: [
+        CategorizationRule(id: _uuid.v4(), pattern: '瑞幸', categoryId: 'food', autoTags: ['下午茶', '咖啡']),
+        CategorizationRule(id: _uuid.v4(), pattern: '喜茶', categoryId: 'food', autoTags: ['下午茶', '奶茶']),
+        CategorizationRule(id: _uuid.v4(), pattern: '星巴克', categoryId: 'food', autoTags: ['下午茶', '咖啡']),
+        CategorizationRule(id: _uuid.v4(), pattern: '淘宝', categoryId: 'shopping', autoTags: []),
+        CategorizationRule(id: _uuid.v4(), pattern: '饿了么', categoryId: 'food', autoTags: ['外卖']),
+        CategorizationRule(id: _uuid.v4(), pattern: '滴滴', categoryId: 'mobility', autoTags: ['打车']),
+      ],
       settings: VaultSettings(
+
         confidentialModeEnabled: confidentialModeEnabled,
         maskAmounts: confidentialModeEnabled,
         quickLockOnBackground: confidentialModeEnabled,
@@ -2556,7 +2709,16 @@ class LedgerBook {
       budgets: budgets,
       goals: goals,
       subscriptions: subscriptions,
+      assetAccounts: const [],
+      customRules: [
+        CategorizationRule(id: _uuid.v4(), pattern: '瑞幸', categoryId: 'food', autoTags: ['下午茶', '咖啡']),
+        CategorizationRule(id: _uuid.v4(), pattern: '喜茶', categoryId: 'food', autoTags: ['下午茶', '奶茶']),
+        CategorizationRule(id: _uuid.v4(), pattern: '星巴克', categoryId: 'food', autoTags: ['下午茶', '咖啡']),
+        CategorizationRule(id: _uuid.v4(), pattern: '美团', categoryId: 'food', autoTags: ['外卖']),
+        CategorizationRule(id: _uuid.v4(), pattern: '滴滴', categoryId: 'mobility', autoTags: ['打车']),
+      ],
       settings: VaultSettings(
+
         confidentialModeEnabled: confidentialModeEnabled,
         maskAmounts: confidentialModeEnabled,
         quickLockOnBackground: confidentialModeEnabled,
@@ -2583,6 +2745,8 @@ class LedgerBook {
   final List<SavingsGoal> goals;
   final List<RecurringPlan> subscriptions;
   final VaultSettings settings;
+  final List<AssetAccount> assetAccounts;
+  final List<CategorizationRule> customRules;
 
   Map<String, dynamic> toJson() => {
     'createdAt': createdAt.toIso8601String(),
@@ -2593,6 +2757,8 @@ class LedgerBook {
     'goals': goals.map((item) => item.toJson()).toList(),
     'subscriptions': subscriptions.map((item) => item.toJson()).toList(),
     'settings': settings.toJson(),
+    'assetAccounts': assetAccounts.map((e) => e.toJson()).toList(),
+    'customRules': customRules.map((e) => e.toJson()).toList(),
   };
 
   factory LedgerBook.fromJson(Map<String, dynamic> json) => LedgerBook(
@@ -2631,6 +2797,8 @@ class LedgerBook {
     settings: VaultSettings.fromJson(
       Map<String, dynamic>.from(json['settings'] as Map? ?? const {}),
     ),
+    assetAccounts: (json['assetAccounts'] as List<dynamic>? ?? []).map((e) => AssetAccount.fromJson(e as Map<String, dynamic>)).toList(),
+    customRules: (json['customRules'] as List<dynamic>? ?? []).map((e) => CategorizationRule.fromJson(e as Map<String, dynamic>)).toList(),
   );
 
   LedgerBook copyWith({
@@ -2642,6 +2810,8 @@ class LedgerBook {
     List<SavingsGoal>? goals,
     List<RecurringPlan>? subscriptions,
     VaultSettings? settings,
+    List<AssetAccount>? assetAccounts,
+    List<CategorizationRule>? customRules,
   }) {
     return LedgerBook(
       createdAt: createdAt ?? this.createdAt,
@@ -2652,6 +2822,8 @@ class LedgerBook {
       goals: goals ?? this.goals,
       subscriptions: subscriptions ?? this.subscriptions,
       settings: settings ?? this.settings,
+      assetAccounts: assetAccounts ?? this.assetAccounts,
+      customRules: customRules ?? this.customRules,
     );
   }
 
@@ -2915,7 +3087,7 @@ const _familyCounterpartyHints = <String>[
 bool _containsHint(String lowercase, List<String> hints) =>
     hints.any((hint) => lowercase.contains(hint.toLowerCase()));
 
-String inferAutoCaptureCategoryId({
+(String, List<String>) inferAutoCaptureCategoryId({
   required LedgerBook book,
   required AutoCaptureRecord capture,
 }) {
@@ -2930,11 +3102,16 @@ String inferAutoCaptureCategoryId({
     ...capture.relatedSources.map((item) => item.label),
   ].join(' ');
   final lowercase = combined.toLowerCase();
+  for (final rule in book.customRules) {
+    if (rule.pattern.isNotEmpty && lowercase.contains(rule.pattern.toLowerCase())) {
+      return (rule.categoryId, rule.autoTags);
+    }
+  }
   final categories = categoriesForType(capture.entryType);
 
   if (capture.entryType == EntryType.expense) {
     if (_containsHint(lowercase, _familyCounterpartyHints)) {
-      return 'family';
+      return ('family', const <String>[]);
     }
 
     final keywordMatch = categories.firstWhereOrNull(
@@ -2945,13 +3122,13 @@ String inferAutoCaptureCategoryId({
           ),
     );
     if (keywordMatch != null) {
-      return keywordMatch.id;
+      return (keywordMatch.id, const <String>[]);
     }
 
     if ((capture.source.isShoppingSource ||
             capture.relatedSources.any((item) => item.isShoppingSource)) &&
         _isValidCategoryIdForType('shopping', EntryType.expense)) {
-      return 'shopping';
+      return ('shopping', const <String>[]);
     }
 
     if (_isValidCategoryIdForType(
@@ -2959,10 +3136,10 @@ String inferAutoCaptureCategoryId({
           EntryType.expense,
         ) &&
         capture.defaultCategoryId != 'shopping') {
-      return capture.defaultCategoryId;
+      return (capture.defaultCategoryId, const <String>[]);
     }
 
-    return resolveDefaultExpenseCategoryId(book.settings);
+    return (resolveDefaultExpenseCategoryId(book.settings), const <String>[]);
   }
 
   final incomeKeywordMatch = categories.firstWhereOrNull(
@@ -2971,12 +3148,12 @@ String inferAutoCaptureCategoryId({
     ),
   );
   if (incomeKeywordMatch != null) {
-    return incomeKeywordMatch.id;
+    return (incomeKeywordMatch.id, const <String>[]);
   }
   if (_isValidCategoryIdForType(capture.defaultCategoryId, EntryType.income)) {
-    return capture.defaultCategoryId;
+    return (capture.defaultCategoryId, const <String>[]);
   }
-  return _fallbackCategoryIdForType(EntryType.income);
+  return (_fallbackCategoryIdForType(EntryType.income), const <String>[]);
 }
 
 String buildAutoCaptureDisplayTitle({
@@ -3093,7 +3270,7 @@ String _normalizedAutoCaptureNote({
   final lines = <String>{
     preferredLine,
     ...base
-        .split('\n')
+        .split('\\n')
         .map((item) => item.trim())
         .where((item) => item.isNotEmpty),
   };
@@ -3109,7 +3286,7 @@ String _normalizedAutoCaptureNote({
             line.startsWith('收款方:')) &&
         line != preferredLine,
   );
-  return lines.join('\n');
+  return lines.join('\\n');
 }
 
 String _preferredDisplayTarget({
@@ -3190,7 +3367,7 @@ String _extractLegacyCounterpartyName(LedgerEntry entry) {
     return entry.counterpartyName.trim();
   }
   final noteMatch = RegExp(
-    r'(?:微信名字|支付宝名字|付款人|收款方)[：:]\s*([^\n]+)',
+    r'(?:微信名字|支付宝名字|付款人|收款方)[：:]\\s*([^\\n]+)',
   ).firstMatch(entry.note);
   final noteCandidate = noteMatch?.group(1)?.trim() ?? '';
   if (_looksLikePersonName(noteCandidate)) {
@@ -3737,7 +3914,7 @@ Future<void> exportLedgerReports(BuildContext context, LedgerBook book) async {
           count.toString(),
         ].join(',');
       }),
-    ].join('\n');
+    ].join('\\n');
 
     final entryRows = <String>[
       'date,time,type,category,period_name,title,merchant,counterparty_name,amount,channel,source,tags,auto_captured,note',
@@ -3761,7 +3938,7 @@ Future<void> exportLedgerReports(BuildContext context, LedgerBook book) async {
           _csvCell(entry.note),
         ].join(',');
       }),
-    ].join('\n');
+    ].join('\\n');
 
     final jsonPayload = const JsonEncoder.withIndent('  ').convert({
       'exportedAt': now.toIso8601String(),
@@ -4191,7 +4368,7 @@ class _CashFlowChartCard extends StatelessWidget {
                           '净结余 ${_safeCurrencyFormatter.format(point.balance)}',
                         ];
                         return BarTooltipItem(
-                          lines.join('\n'),
+                          lines.join('\\n'),
                           GoogleFonts.plusJakartaSans(
                             color: Colors.white,
                             fontWeight: FontWeight.w600,
@@ -5569,14 +5746,37 @@ class _EntryTile extends StatelessWidget {
                       ),
                     ),
                   ],
-                  if (entry.tags.isNotEmpty) ...[
+                  if (entry.tags.isNotEmpty || entry.linkedRefundEntryIds.isNotEmpty || entry.locationInfo.isNotEmpty) ...[
                     const SizedBox(height: 8),
                     Wrap(
+                      crossAxisAlignment: WrapCrossAlignment.center,
                       spacing: 6,
                       runSpacing: 6,
-                      children: entry.tags
-                          .take(3)
-                          .map(
+                      children: [
+                        if (entry.locationInfo.isNotEmpty)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                            decoration: BoxDecoration(color: const Color(0xFFE8EAF6), borderRadius: BorderRadius.circular(6)),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.location_on, size: 11, color: Color(0xFF5C6BC0)),
+                                const SizedBox(width: 2),
+                                Text(entry.locationInfo, style: GoogleFonts.plusJakartaSans(fontSize: 11, fontWeight: FontWeight.w600, color: const Color(0xFF5C6BC0))),
+                              ],
+                            ),
+                          ),
+                        if (entry.linkedRefundEntryIds.isNotEmpty && viewState.book != null)
+                          Builder(builder: (context) {
+                            final refundAmount = entry.linkedRefundEntryIds.map((id) => viewState.book!.entries.where((e) => e.id == id).firstOrNull?.amount ?? 0.0).fold<double>(0.0, (a, b) => a + b);
+                            return Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                              decoration: BoxDecoration(color: const Color(0xFFEBF8EE), borderRadius: BorderRadius.circular(6)),
+                              child: Text('已关联退款 +￥${refundAmount.toStringAsFixed(2)}', style: GoogleFonts.plusJakartaSans(fontSize: 11, fontWeight: FontWeight.w600, color: const Color(0xFF11A66A))),
+                            );
+                          }),
+                        ...entry.tags.take(3).map(
+
                             (tag) => Container(
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 8,
@@ -5595,8 +5795,8 @@ class _EntryTile extends StatelessWidget {
                                 ),
                               ),
                             ),
-                          )
-                          .toList(),
+                          ).toList(),
+                      ],
                     ),
                   ],
                 ],
@@ -5990,6 +6190,13 @@ class DashboardScreen extends ConsumerWidget {
                   ],
                 ),
               ),
+              const SizedBox(height: 22),
+              _SectionHeader(title: '目前我的资产', actionLabel: '管理', onTap: () => pushPremiumPage<void>(context, page: AssetAccountsView(book: book))),
+              const SizedBox(height: 12),
+              AssetAccountsCard(book: book, viewState: viewState),
+              const SizedBox(height: 12),
+              SubscriptionRadarCard(book: book),
+              BurnRatePredictorCard(book: book),
               const SizedBox(height: 22),
               _SectionHeader(title: '近六个月现金流', actionLabel: '', onTap: null),
               const SizedBox(height: 12),
@@ -7375,6 +7582,8 @@ class InsightsScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 18),
+              MoodConsumptionChartCard(book: book),
+              const SizedBox(height: 18),
               _GlassCard(
                 child: SizedBox(
                   height: 260,
@@ -7420,6 +7629,10 @@ class InsightsScreen extends StatelessWidget {
                   padding: const EdgeInsets.only(bottom: 12),
                   child: _PillarTile(pillar: pillar, state: viewState),
                 ),
+              const SizedBox(height: 24),
+              HeatmapView(book: book),
+              const SizedBox(height: 24),
+              SankeyView(book: book),
             ],
           ),
         ),
@@ -7673,6 +7886,61 @@ class VaultScreen extends ConsumerWidget {
                   ],
                 ),
               ),
+
+              const SizedBox(height: 22),
+              _SectionHeader(
+                title: '空间与资产自动化',
+                actionLabel: '',
+                onTap: null,
+              ),
+              const SizedBox(height: 12),
+              _GlassCard(
+                child: Column(
+                  children: [
+                    DropdownButtonFormField<LocationTrackingMode>(
+                      value: book.settings.locationMode,
+                      decoration: const InputDecoration(labelText: '位置记账助手模式'),
+                      items: const [
+                        DropdownMenuItem(value: LocationTrackingMode.off, child: Text('关闭位置记录')),
+                        DropdownMenuItem(value: LocationTrackingMode.foregroundLazy, child: Text('前台懒加载模式 (推荐)')),
+                        DropdownMenuItem(value: LocationTrackingMode.ipRough, child: Text('网络 IP 粗略定位')),
+                        DropdownMenuItem(value: LocationTrackingMode.backgroundPrecise, child: Text('后台精确定位 (可能耗电)')),
+                      ],
+                      onChanged: (value) {
+                        if (value == null) return;
+                        controller.updateSettings(book.settings.copyWith(locationMode: value));
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(color: const Color(0xFFE8EAF6), borderRadius: BorderRadius.circular(8)),
+                        child: const Icon(Icons.rule, color: Color(0xFF5C6BC0), size: 20),
+                      ),
+                      title: const Text('自定义分类规则'),
+                      subtitle: Text('已配置 ${book.customRules.length} 条规则'),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => pushPremiumPage<void>(context, page: SettingsCustomRulesView(book: book)),
+                    ),
+                    const SizedBox(height: 12),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(color: const Color(0xFFE8EAF6), borderRadius: BorderRadius.circular(8)),
+                        child: const Icon(Icons.account_balance_wallet, color: Color(0xFF5C6BC0), size: 20),
+                      ),
+                      title: const Text('资金账户池'),
+                      subtitle: Text('已绑定 ${book.assetAccounts.length} 个期初资产'),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => pushPremiumPage<void>(context, page: AssetAccountsView(book: book)),
+                    ),
+                  ],
+                ),
+              ),
+
               const SizedBox(height: 22),
               _SectionHeader(
                 title: '备份与隐私',
@@ -8061,7 +8329,7 @@ DateTime _combineDateAndTime(DateTime date, TimeOfDay time) {
 
 List<String> _parseEntryTags(String raw) {
   return raw
-      .split(RegExp(r'[\n,，|]+'))
+      .split(RegExp(r'[\\n,，|]+'))
       .map((item) => item.trim())
       .where((item) => item.isNotEmpty)
       .toSet()
@@ -8128,6 +8396,7 @@ Future<void> showEntrySheet(
   );
   var type = initialType;
   var channel = initialEntry?.channel ?? PaymentChannel.wechatPay;
+  var selectedMood = initialEntry?.mood ?? ExpenseMood.none;
   var categoryId =
       initialEntry?.categoryId ??
       (initialType == EntryType.expense
@@ -8237,6 +8506,35 @@ Future<void> showEntrySheet(
                   decoration: const InputDecoration(labelText: '备注'),
                 ),
                 const SizedBox(height: 12),
+                const SizedBox(height: 16),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('这一单的心情状态: ${selectedMood.label} ${selectedMood.emoji}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        children: ExpenseMood.values.map((m) {
+                          final isSelected = selectedMood == m;
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 8.0),
+                            child: FilterChip(
+                              label: Text(m.emoji),
+                              selected: isSelected,
+                              onSelected: (val) {
+                                setModalState(() => selectedMood = m);
+                              },
+                              selectedColor: m.color.withValues(alpha: 0.2),
+                              side: isSelected ? BorderSide(color: m.color, width: 2) : null,
+                            ),
+                          );
+                        }).toList(),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
                 ListTile(
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(18),
@@ -8321,6 +8619,7 @@ Future<void> showEntrySheet(
                                 channel: channel,
                                 occurredAt: occurredAt,
                                 tags: parsedTags,
+                                mood: selectedMood,
                                 autoCaptured: false,
                                 sourceLabel: '',
                               ),
@@ -8337,6 +8636,7 @@ Future<void> showEntrySheet(
                           channel: channel,
                           occurredAt: occurredAt,
                           tags: parsedTags,
+                          mood: selectedMood,
                         );
                         final protected = edited.copyWith(
                           manualOverrideFields: initialEntry.autoCaptured
