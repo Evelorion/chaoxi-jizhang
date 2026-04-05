@@ -136,6 +136,37 @@ object NotificationParser {
             "交易成功",
             "收款成功",
         ),
+        "bank" to listOf(
+            "消费",
+            "消費",
+            "支出",
+            "转入",
+            "轉入",
+            "转出",
+            "轉出",
+            "入账",
+            "入帳",
+            "扣款",
+            "动账",
+            "動賬",
+            "交易",
+            "工资",
+            "工資",
+            "收入",
+            "余额",
+            "餘額",
+            "尾号",
+            "尾號",
+            "账户",
+            "賬戶",
+            "储蓄卡",
+            "儲蓄卡",
+            "信用卡",
+            "借记卡",
+            "借記卡",
+            "人民币",
+            "人民幣",
+        ),
     )
 
     private val shoppingNoiseKeywords = listOf(
@@ -408,6 +439,14 @@ object NotificationParser {
         "com.jingdong.app.mall" -> "jd"
         "com.xunmeng.pinduoduo" -> "pinduoduo"
         "com.taobao.idlefish" -> "xianyu"
+        // 六大国有银行
+        "com.icbc",
+        "com.icbc.im" -> "bank"
+        "com.chinamworld.main" -> "bank"
+        "com.android.bankabc" -> "bank"
+        "com.chinamworld.bocmbci" -> "bank"
+        "com.bankcomm.Bankcomm" -> "bank"
+        "com.yitong.mbank.psbc" -> "bank"
         else -> null
     }
 
@@ -733,6 +772,7 @@ object NotificationParser {
             source == "wechat" -> "wechatPay"
             source == "alipay" -> "alipay"
             source == "googlePay" -> "googlePay"
+            source == "bank" -> "bankCard"
             lowercase.contains("微信") || lowercase.contains("wechat") -> "wechatPay"
             lowercase.contains("支付寶") || lowercase.contains("支付宝") || lowercase.contains("花唄") || lowercase.contains("花呗") ->
                 "alipay"
@@ -747,6 +787,13 @@ object NotificationParser {
             return "shopping"
         }
         val lowercase = "$text $merchant".lowercase()
+        // 银行工资/收入特殊处理
+        if (source == "bank") {
+            val incomeHints = listOf("工资", "工資", "薪资", "薪資", "奖金", "獎金", "绩效", "績效", "入账", "入帳", "转入", "轉入", "收入")
+            if (incomeHints.any { lowercase.contains(it.lowercase()) }) {
+                return "salary"
+            }
+        }
         val mapping = listOf(
             "food" to listOf("咖啡", "餐", "外卖", "外賣", "coffee", "tea", "奶茶"),
             "mobility" to listOf("滴滴", "地铁", "地鐵", "公交", "uber", "taxi", "高铁", "高鐵"),
@@ -760,7 +807,7 @@ object NotificationParser {
         )
         return mapping.firstOrNull { (_, keywords) ->
             keywords.any { lowercase.contains(it.lowercase()) }
-        }?.first ?: "shopping"
+        }?.first ?: if (source == "bank") "daily" else "shopping"
     }
 
     private fun buildDetailSummary(
