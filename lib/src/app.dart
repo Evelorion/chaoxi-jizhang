@@ -21,12 +21,15 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart' as ph;
 import 'package:uuid/uuid.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
 
 part 'ui_extensions.dart';
 part 'ui_predict_cards.dart';
 part 'nlp_engine.dart';
 part 'ui_voice_fab.dart';
 part 'location_helper.dart';
+part 'ui_location_map.dart';
 
 const _uuid = Uuid();
 const _ledgerFileName = 'chaoxi_vault.enc';
@@ -599,25 +602,55 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     final passphrase = _sessionPassphrase;
     if (book == null || passphrase == null) return;
 
-    // Auto-inject location if not already set
-    var finalEntry = entry;
-    if (entry.locationInfo.isEmpty) {
-      final loc = await LocationHelper.getCurrentLocation();
-      if (loc.isNotEmpty) {
-        finalEntry = entry.copyWith(locationInfo: loc);
-      }
-    }
-
+    // Save entry immediately — never block on location
     final updated = book.copyWith(
-      entries: [...book.entries, finalEntry]
+      entries: [...book.entries, entry]
         ..sort((a, b) => b.occurredAt.compareTo(a.occurredAt)),
       updatedAt: DateTime.now(),
     );
     await _persistBook(
       updated,
       passphrase,
-      notice: '已添加一笔${finalEntry.type.label}。',
+      notice: '已添加一笔${entry.type.label}。',
     );
+
+    // Backfill location in background (non-blocking)
+    if (entry.locationInfo.isEmpty &&
+        book.settings.locationMode != LocationTrackingMode.off) {
+      _backfillLocation(entry.id);
+    }
+  }
+
+  /// Fetches location asynchronously and patches the entry without blocking UI.
+  Future<void> _backfillLocation(String entryId) async {
+    try {
+      final locResult = await LocationHelper.getDetailedLocation();
+      if (locResult.isEmpty) return;
+
+      final currentBook = state.book;
+      final passphrase = _sessionPassphrase;
+      if (currentBook == null || passphrase == null) return;
+
+      final idx = currentBook.entries.indexWhere((e) => e.id == entryId);
+      if (idx == -1) return;
+
+      final patched = currentBook.entries[idx].copyWith(
+        locationInfo: locResult.address,
+        latitude: locResult.latitude,
+        longitude: locResult.longitude,
+      );
+
+      final newEntries = [...currentBook.entries];
+      newEntries[idx] = patched;
+
+      final updatedBook = currentBook.copyWith(
+        entries: newEntries,
+        updatedAt: DateTime.now(),
+      );
+      await _persistBook(updatedBook, passphrase);
+    } catch (_) {
+      // Location backfill is best-effort; silently ignore failures
+    }
   }
 
   Future<void> updateEntry(LedgerEntry entry) async {
@@ -793,6 +826,42 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     await _persistBook(updated, passphrase, notice: '命名账期已删除。');
   }
 
+  Future<void> addFavoriteLocation(FavoriteLocation location) async {
+    final book = state.book;
+    final passphrase = _sessionPassphrase;
+    if (book == null || passphrase == null) return;
+
+    final updated = book.copyWith(
+      favoriteLocations: [...book.favoriteLocations, location],
+      updatedAt: DateTime.now(),
+    );
+    await _persistBook(updated, passphrase, notice: '已添加常用地点「${location.name}」。');
+  }
+
+  Future<void> removeFavoriteLocation(String id) async {
+    final book = state.book;
+    final passphrase = _sessionPassphrase;
+    if (book == null || passphrase == null) return;
+
+    final locations = book.favoriteLocations.where((item) => item.id != id).toList();
+    if (locations.length == book.favoriteLocations.length) return;
+
+    final updated = book.copyWith(favoriteLocations: locations, updatedAt: DateTime.now());
+    await _persistBook(updated, passphrase, notice: '常用地点已删除。');
+  }
+
+  Future<void> updateFavoriteLocation(FavoriteLocation location) async {
+    final book = state.book;
+    final passphrase = _sessionPassphrase;
+    if (book == null || passphrase == null) return;
+
+    final locations = book.favoriteLocations.map((item) {
+      return item.id == location.id ? location : item;
+    }).toList();
+    final updated = book.copyWith(favoriteLocations: locations, updatedAt: DateTime.now());
+    await _persistBook(updated, passphrase, notice: '常用地点已更新。');
+  }
+
   Future<void> syncAutoCapturedEntries({bool silent = false}) async {
     final book = state.book;
     final passphrase = _sessionPassphrase;
@@ -899,6 +968,15 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       notice: '自动记账已同步 $summary，覆盖微信 / 支付宝 / Google Pay / 淘宝 / 京东 / 拼多多 / 闲鱼。',
       lastAutoSyncAt: DateTime.now(),
     );
+
+    // Backfill location for newly created entries (if enabled)
+    if (book.settings.autoRecordLocation && createdCount > 0) {
+      for (final entry in workingEntries) {
+        if (entry.locationInfo.isEmpty) {
+          _backfillLocation(entry.id);
+        }
+      }
+    }
   }
 
   Future<LedgerEntry> _captureToEntry(AutoCaptureRecord capture, LedgerBook book) async {
@@ -942,11 +1020,28 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         '${capture.source.label}入账',
     }.toList();
 
-    // Try to get current location for auto-captured entries
+    // Try to get current location for auto-captured entries (respect setting)
     String autoLocation = '';
-    try {
-      autoLocation = await LocationHelper.getCurrentLocation();
-    } catch (_) {}
+    double? autoLat;
+    double? autoLon;
+    String autoMerchant = capture.merchant;
+    if (book.settings.locationMode != LocationTrackingMode.off) {
+      try {
+        final locResult = await LocationHelper.getDetailedLocation();
+        if (locResult.isNotEmpty) {
+          autoLocation = locResult.address;
+          autoLat = locResult.latitude;
+          autoLon = locResult.longitude;
+          // Auto merchant identification via POI if merchant is empty
+          if (capture.merchant.isEmpty) {
+            try {
+              final poi = await LocationHelper.getNearbyPOI(locResult.latitude, locResult.longitude);
+              if (poi.isNotEmpty) autoMerchant = poi;
+            } catch (_) {}
+          }
+        }
+      } catch (_) {}
+    }
 
     return LedgerEntry(
       id: capture.id,
@@ -956,7 +1051,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         merchant: capture.merchant,
         counterpartyName: capture.counterpartyName,
       ),
-      merchant: capture.merchant,
+      merchant: autoMerchant,
       counterpartyName: capture.counterpartyName,
       note: _normalizedAutoCaptureNote(
         detailSummary: capture.detailSummary,
@@ -976,6 +1071,8 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         if (capture.confidence >= 0.85) '高置信度',
       ],
       locationInfo: autoLocation,
+      latitude: autoLat,
+      longitude: autoLon,
       autoCaptured: true,
       sourceLabel: capture.source.label,
       autoMergeKey: capture.mergeKey,
@@ -2068,6 +2165,72 @@ String _fallbackCategoryIdForType(EntryType type) {
 enum LocationTrackingMode { off, foregroundLazy, backgroundPrecise, ipRough }
 enum AssetType { wechat, alipay, bankCard, cash, other }
 
+class FavoriteLocation {
+  const FavoriteLocation({
+    required this.id,
+    required this.name,
+    required this.address,
+    required this.latitude,
+    required this.longitude,
+    this.categoryId,
+    this.defaultTitle,
+    this.defaultAmount,
+  });
+
+  final String id;
+  final String name;
+  final String address;
+  final double latitude;
+  final double longitude;
+  final String? categoryId;
+  final String? defaultTitle;
+  final double? defaultAmount;
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'address': address,
+    'latitude': latitude,
+    'longitude': longitude,
+    'categoryId': categoryId,
+    'defaultTitle': defaultTitle,
+    'defaultAmount': defaultAmount,
+  };
+
+  factory FavoriteLocation.fromJson(Map<String, dynamic> json) => FavoriteLocation(
+    id: json['id'] as String,
+    name: json['name'] as String,
+    address: json['address'] as String,
+    latitude: (json['latitude'] as num).toDouble(),
+    longitude: (json['longitude'] as num).toDouble(),
+    categoryId: json['categoryId'] as String?,
+    defaultTitle: json['defaultTitle'] as String?,
+    defaultAmount: (json['defaultAmount'] as num?)?.toDouble(),
+  );
+
+  FavoriteLocation copyWith({
+    String? id,
+    String? name,
+    String? address,
+    double? latitude,
+    double? longitude,
+    Object? categoryId = _unset,
+    Object? defaultTitle = _unset,
+    Object? defaultAmount = _unset,
+  }) {
+    return FavoriteLocation(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      address: address ?? this.address,
+      latitude: latitude ?? this.latitude,
+      longitude: longitude ?? this.longitude,
+      categoryId: categoryId == _unset ? this.categoryId : categoryId as String?,
+      defaultTitle: defaultTitle == _unset ? this.defaultTitle : defaultTitle as String?,
+      defaultAmount: defaultAmount == _unset ? this.defaultAmount : defaultAmount as double?,
+    );
+  }
+}
+
 class AssetAccount {
   const AssetAccount({
     required this.id,
@@ -2153,6 +2316,8 @@ class LedgerEntry {
     this.tags = const [],
     this.linkedRefundEntryIds = const [],
     this.locationInfo = '',
+    this.latitude,
+    this.longitude,
     this.mood = ExpenseMood.none,
     required this.autoCaptured,
     required this.sourceLabel,
@@ -2175,6 +2340,8 @@ class LedgerEntry {
   final List<String> tags;
   final List<String> linkedRefundEntryIds;
   final String locationInfo;
+  final double? latitude;
+  final double? longitude;
   final ExpenseMood mood;
   final bool autoCaptured;
   final String sourceLabel;
@@ -2197,6 +2364,8 @@ class LedgerEntry {
     List<String>? tags,
     List<String>? linkedRefundEntryIds,
     String? locationInfo,
+    double? latitude,
+    double? longitude,
     ExpenseMood? mood,
     bool? autoCaptured,
     String? sourceLabel,
@@ -2219,6 +2388,8 @@ class LedgerEntry {
       tags: tags ?? this.tags,
       linkedRefundEntryIds: linkedRefundEntryIds ?? this.linkedRefundEntryIds,
       locationInfo: locationInfo ?? this.locationInfo,
+      latitude: latitude ?? this.latitude,
+      longitude: longitude ?? this.longitude,
       mood: mood ?? this.mood,
       autoCaptured: autoCaptured ?? this.autoCaptured,
       sourceLabel: sourceLabel ?? this.sourceLabel,
@@ -2243,6 +2414,8 @@ class LedgerEntry {
     'tags': tags,
     'linkedRefundEntryIds': linkedRefundEntryIds,
     'locationInfo': locationInfo,
+    'latitude': latitude,
+    'longitude': longitude,
     'mood': mood.name,
     'autoCaptured': autoCaptured,
     'sourceLabel': sourceLabel,
@@ -2266,6 +2439,8 @@ class LedgerEntry {
     tags: (json['tags'] as List<dynamic>? ?? const []).cast<String>(),
     linkedRefundEntryIds: (json['linkedRefundEntryIds'] as List<dynamic>? ?? const []).cast<String>(),
     locationInfo: json['locationInfo'] as String? ?? '',
+    latitude: (json['latitude'] as num?)?.toDouble(),
+    longitude: (json['longitude'] as num?)?.toDouble(),
     mood: ExpenseMood.values.firstWhere((e) => e.name == json['mood'], orElse: () => ExpenseMood.none),
     autoCaptured: json['autoCaptured'] as bool? ?? false,
     sourceLabel: json['sourceLabel'] as String? ?? '',
@@ -2438,6 +2613,7 @@ class VaultSettings {
     required this.bankEnabled,
     this.voiceInputEnabled = true,
     this.locationMode = LocationTrackingMode.off,
+    this.autoRecordLocation = false,
   });
 
   final bool confidentialModeEnabled;
@@ -2457,6 +2633,7 @@ class VaultSettings {
   final bool bankEnabled;
   final bool voiceInputEnabled;
   final LocationTrackingMode locationMode;
+  final bool autoRecordLocation;
 
   Map<String, dynamic> toJson() => {
     'confidentialModeEnabled': confidentialModeEnabled,
@@ -2476,6 +2653,7 @@ class VaultSettings {
     'bankEnabled': bankEnabled,
     'voiceInputEnabled': voiceInputEnabled,
     'locationMode': locationMode.name,
+    'autoRecordLocation': autoRecordLocation,
   };
 
   factory VaultSettings.fromJson(Map<String, dynamic> json) => VaultSettings(
@@ -2497,6 +2675,7 @@ class VaultSettings {
     bankEnabled: json['bankEnabled'] as bool? ?? true,
     voiceInputEnabled: json['voiceInputEnabled'] as bool? ?? true,
     locationMode: LocationTrackingMode.values.firstWhere((e) => e.name == (json['locationMode'] as String?), orElse: () => LocationTrackingMode.off),
+    autoRecordLocation: json['autoRecordLocation'] as bool? ?? false,
   );
 
   VaultSettings copyWith({
@@ -2517,6 +2696,7 @@ class VaultSettings {
     bool? bankEnabled,
     bool? voiceInputEnabled,
     LocationTrackingMode? locationMode,
+    bool? autoRecordLocation,
   }) {
     return VaultSettings(
       confidentialModeEnabled:
@@ -2540,6 +2720,7 @@ class VaultSettings {
       bankEnabled: bankEnabled ?? this.bankEnabled,
       voiceInputEnabled: voiceInputEnabled ?? this.voiceInputEnabled,
       locationMode: locationMode ?? this.locationMode,
+      autoRecordLocation: autoRecordLocation ?? this.autoRecordLocation,
     );
   }
 }
@@ -2556,6 +2737,7 @@ class LedgerBook {
     required this.settings,
     this.assetAccounts = const [],
     this.customRules = const [],
+    this.favoriteLocations = const [],
   });
 
   factory LedgerBook.empty(bool confidentialModeEnabled) {
@@ -2888,6 +3070,7 @@ class LedgerBook {
   final VaultSettings settings;
   final List<AssetAccount> assetAccounts;
   final List<CategorizationRule> customRules;
+  final List<FavoriteLocation> favoriteLocations;
 
   Map<String, dynamic> toJson() => {
     'createdAt': createdAt.toIso8601String(),
@@ -2900,6 +3083,7 @@ class LedgerBook {
     'settings': settings.toJson(),
     'assetAccounts': assetAccounts.map((e) => e.toJson()).toList(),
     'customRules': customRules.map((e) => e.toJson()).toList(),
+    'favoriteLocations': favoriteLocations.map((e) => e.toJson()).toList(),
   };
 
   factory LedgerBook.fromJson(Map<String, dynamic> json) => LedgerBook(
@@ -2940,6 +3124,7 @@ class LedgerBook {
     ),
     assetAccounts: (json['assetAccounts'] as List<dynamic>? ?? []).map((e) => AssetAccount.fromJson(e as Map<String, dynamic>)).toList(),
     customRules: (json['customRules'] as List<dynamic>? ?? []).map((e) => CategorizationRule.fromJson(e as Map<String, dynamic>)).toList(),
+    favoriteLocations: (json['favoriteLocations'] as List<dynamic>? ?? []).map((e) => FavoriteLocation.fromJson(e as Map<String, dynamic>)).toList(),
   );
 
   LedgerBook copyWith({
@@ -2953,6 +3138,7 @@ class LedgerBook {
     VaultSettings? settings,
     List<AssetAccount>? assetAccounts,
     List<CategorizationRule>? customRules,
+    List<FavoriteLocation>? favoriteLocations,
   }) {
     return LedgerBook(
       createdAt: createdAt ?? this.createdAt,
@@ -2965,6 +3151,7 @@ class LedgerBook {
       settings: settings ?? this.settings,
       assetAccounts: assetAccounts ?? this.assetAccounts,
       customRules: customRules ?? this.customRules,
+      favoriteLocations: favoriteLocations ?? this.favoriteLocations,
     );
   }
 
@@ -4212,6 +4399,7 @@ bool matchesTransactionQuery(
     entry.merchant,
     entry.counterpartyName,
     entry.note,
+    entry.locationInfo,
     periodName,
     entry.sourceLabel,
     category.name,
@@ -6509,6 +6697,7 @@ class _TransactionsScreenState extends ConsumerState<TransactionsScreen> {
         'xianyu' =>
           entry.sourceLabel == CaptureSource.xianyu.label ||
               entry.tags.contains(CaptureSource.xianyu.label),
+        'location' => entry.locationInfo.isNotEmpty,
         _ => true,
       };
       final periodMatched =
@@ -6562,7 +6751,7 @@ class _TransactionsScreenState extends ConsumerState<TransactionsScreen> {
                 onChanged: (value) => setState(() => _query = value),
                 decoration: InputDecoration(
                   prefixIcon: const Icon(Icons.search_rounded),
-                  hintText: '搜索标题、商户、账期、备注、金额、标签或渠道',
+                  hintText: '搜索标题、商户、账期、备注、金额、标签、位置或渠道',
                   suffixIcon: _query.isEmpty
                       ? null
                       : IconButton(
@@ -6613,6 +6802,7 @@ class _TransactionsScreenState extends ConsumerState<TransactionsScreen> {
                       ('jd', '京东'),
                       ('pinduoduo', '拼多多'),
                       ('xianyu', '闲鱼'),
+                      ('location', '📍 有位置'),
                     ])
                       Padding(
                         padding: const EdgeInsets.only(right: 8),
@@ -7828,6 +8018,132 @@ class InsightsScreen extends StatelessWidget {
               HeatmapView(book: book),
               const SizedBox(height: 24),
               SankeyView(book: book),
+              const SizedBox(height: 24),
+              // --- Map Entry Card ---
+              _GlassCard(
+                child: ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF5C6BC0), Color(0xFF7986CB)],
+                      ),
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: const Icon(Icons.map_rounded, color: Colors.white, size: 22),
+                  ),
+                  title: Text('消费地图', style: GoogleFonts.spaceGrotesk(fontWeight: FontWeight.w700)),
+                  subtitle: Text(
+                    '查看你的钱都花在了哪里',
+                    style: GoogleFonts.plusJakartaSans(color: const Color(0xFF60708A)),
+                  ),
+                  trailing: const Icon(Icons.chevron_right, color: Color(0xFF5C6BC0)),
+                  onTap: () => pushPremiumPage<void>(context, page: LocationSpendMapPage(book: book)),
+                ),
+              ),
+              const SizedBox(height: 22),
+              // --- Region Spend Analysis ---
+              _SectionHeader(title: '区域消费分布', actionLabel: '', onTap: null),
+              const SizedBox(height: 12),
+              Builder(builder: (context) {
+                final regions = regionSpendAnalysis(book);
+                if (regions.isEmpty) {
+                  return _GlassCard(
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(20),
+                        child: Text(
+                          '暂无位置数据，开启位置记账后这里会展示各区域消费占比。',
+                          textAlign: TextAlign.center,
+                          style: GoogleFonts.plusJakartaSans(color: const Color(0xFF60708A)),
+                        ),
+                      ),
+                    ),
+                  );
+                }
+                final top5 = regions.take(5).toList();
+                final total = top5.fold<double>(0, (s, r) => s + r.amount);
+                const regionColors = [
+                  Color(0xFF5C6BC0), Color(0xFF26A69A), Color(0xFFFF7043),
+                  Color(0xFFAB47BC), Color(0xFF42A5F5),
+                ];
+                return _GlassCard(
+                  child: Column(
+                    children: [
+                      SizedBox(
+                        height: 180,
+                        child: RepaintBoundary(
+                          child: PieChart(
+                            PieChartData(
+                              sectionsSpace: 3,
+                              centerSpaceRadius: 40,
+                              sections: [
+                                for (var i = 0; i < top5.length; i++)
+                                  PieChartSectionData(
+                                    value: top5[i].amount,
+                                    title: top5[i].region,
+                                    color: regionColors[i % regionColors.length],
+                                    radius: 46,
+                                    titleStyle: GoogleFonts.plusJakartaSans(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.white,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      for (var i = 0; i < top5.length; i++)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 8),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 12, height: 12,
+                                decoration: BoxDecoration(
+                                  color: regionColors[i % regionColors.length],
+                                  borderRadius: BorderRadius.circular(3),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  top5[i].region,
+                                  style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w600),
+                                ),
+                              ),
+                              Text(
+                                '${top5[i].count}笔',
+                                style: GoogleFonts.plusJakartaSans(
+                                  color: const Color(0xFF7A869C), fontSize: 12,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Text(
+                                _safeCurrencyFormatter.format(top5[i].amount),
+                                style: GoogleFonts.spaceGrotesk(
+                                  fontWeight: FontWeight.w700,
+                                  color: regionColors[i % regionColors.length],
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                '${(top5[i].amount / total * 100).toStringAsFixed(0)}%',
+                                style: GoogleFonts.plusJakartaSans(
+                                  fontSize: 12, color: const Color(0xFF7A869C),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                  ),
+                );
+              }),
             ],
           ),
         ),
@@ -8130,6 +8446,33 @@ class VaultScreen extends ConsumerWidget {
                         if (value == null) return;
                         controller.updateSettings(book.settings.copyWith(locationMode: value));
                       },
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      secondary: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(color: const Color(0xFFE8F5E9), borderRadius: BorderRadius.circular(8)),
+                        child: const Icon(Icons.location_on, color: Color(0xFF43A047), size: 20),
+                      ),
+                      title: const Text('自动记账记录位置'),
+                      subtitle: const Text('自动记账时同步获取当前位置'),
+                      value: book.settings.autoRecordLocation,
+                      onChanged: (value) {
+                        controller.updateSettings(book.settings.copyWith(autoRecordLocation: value));
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(color: const Color(0xFFFFF3E0), borderRadius: BorderRadius.circular(8)),
+                        child: const Icon(Icons.bookmark_rounded, color: Color(0xFFFF7043), size: 20),
+                      ),
+                      title: const Text('常用地点管理'),
+                      subtitle: Text('已收藏 ${book.favoriteLocations.length} 个地点'),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () => pushPremiumPage<void>(context, page: FavoriteLocationsPage(book: book)),
                     ),
                     const SizedBox(height: 12),
                     ListTile(
@@ -8631,6 +8974,9 @@ Future<void> showEntrySheet(
     initialMoment.day,
   );
   var selectedTime = TimeOfDay.fromDateTime(initialMoment);
+  double? entryLat = initialEntry?.latitude;
+  double? entryLon = initialEntry?.longitude;
+  var nearbySummary = '';
 
   await showModalBottomSheet<void>(
     context: context,
@@ -8724,11 +9070,164 @@ Future<void> showEntrySheet(
                 const SizedBox(height: 12),
                 TextField(
                   controller: locationController,
-                  decoration: const InputDecoration(
+                  decoration: InputDecoration(
                     labelText: '地址 / 位置',
-                    prefixIcon: Icon(Icons.location_on_outlined),
+                    prefixIcon: const Icon(Icons.location_on_outlined),
+                    suffixIcon: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (book.favoriteLocations.isNotEmpty)
+                          IconButton(
+                            icon: const Icon(Icons.bookmark_rounded, color: Color(0xFFFF7043)),
+                            tooltip: '从收藏选择',
+                            onPressed: () async {
+                              final selected = await showModalBottomSheet<FavoriteLocation>(
+                                context: context,
+                                builder: (ctx) => Container(
+                                  padding: const EdgeInsets.all(20),
+                                  decoration: const BoxDecoration(
+                                    color: Colors.white,
+                                    borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+                                  ),
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text('常用地点', style: GoogleFonts.spaceGrotesk(fontSize: 18, fontWeight: FontWeight.w700)),
+                                      const SizedBox(height: 12),
+                                      ...book.favoriteLocations.map((fav) => ListTile(
+                                        leading: const Icon(Icons.location_on, color: Color(0xFF5C6BC0)),
+                                        title: Text(fav.name, style: const TextStyle(fontWeight: FontWeight.w600)),
+                                        subtitle: Text(fav.address, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                        trailing: fav.categoryId != null
+                                            ? Icon(categoryForId(fav.categoryId!).icon, color: categoryForId(fav.categoryId!).color, size: 18)
+                                            : null,
+                                        onTap: () => Navigator.of(ctx).pop(fav),
+                                      )),
+                                    ],
+                                  ),
+                                ),
+                              );
+                              if (selected != null) {
+                                setModalState(() {
+                                  locationController.text = selected.address;
+                                  entryLat = selected.latitude;
+                                  entryLon = selected.longitude;
+                                  // Apply template defaults
+                                  if (selected.defaultTitle != null && selected.defaultTitle!.isNotEmpty && titleController.text.isEmpty) {
+                                    titleController.text = selected.defaultTitle!;
+                                  }
+                                  if (selected.defaultAmount != null && amountController.text.isEmpty) {
+                                    amountController.text = selected.defaultAmount!.toStringAsFixed(2);
+                                  }
+                                  if (selected.categoryId != null) {
+                                    categoryId = selected.categoryId!;
+                                  }
+                                  nearbySummary = nearbySummaryForLocation(book, selected.address);
+                                });
+                              }
+                            },
+                          ),
+                        IconButton(
+                          icon: const Icon(Icons.my_location, color: Color(0xFF5C6BC0)),
+                          tooltip: '自动获取当前位置',
+                          onPressed: () async {
+                            setModalState(() {
+                              locationController.text = '正在定位...';
+                            });
+                            try {
+                              final locResult = await LocationHelper.getDetailedLocation();
+                              if (!context.mounted) return;
+                              if (locResult.isNotEmpty) {
+                                entryLat = locResult.latitude;
+                                entryLon = locResult.longitude;
+                                // Check favorite match
+                                final matchedFav = LocationHelper.findNearestFavorite(
+                                  locResult.latitude, locResult.longitude, book.favoriteLocations,
+                                );
+                                if (matchedFav != null) {
+                                  if (matchedFav.defaultTitle != null && matchedFav.defaultTitle!.isNotEmpty && titleController.text.isEmpty) {
+                                    titleController.text = matchedFav.defaultTitle!;
+                                  }
+                                  if (matchedFav.defaultAmount != null && amountController.text.isEmpty) {
+                                    amountController.text = matchedFav.defaultAmount!.toStringAsFixed(2);
+                                  }
+                                  if (matchedFav.categoryId != null && context.mounted) {
+                                    setModalState(() => categoryId = matchedFav.categoryId!);
+                                  }
+                                }
+                                // Smart category from POI
+                                try {
+                                  final poi = await LocationHelper.getNearbyPOI(locResult.latitude, locResult.longitude);
+                                  if (!context.mounted) return;
+                                  if (poi.isNotEmpty) {
+                                    final suggestedCat = LocationHelper.suggestCategoryFromPOI(poi);
+                                    if (suggestedCat != null && matchedFav?.categoryId == null) {
+                                      setModalState(() => categoryId = suggestedCat);
+                                    }
+                                    if (merchantController.text.isEmpty) {
+                                      merchantController.text = poi;
+                                    }
+                                  }
+                                } catch (_) {}
+                                if (context.mounted) {
+                                  setModalState(() {
+                                    locationController.text = locResult.address.isNotEmpty ? locResult.address : '';
+                                    nearbySummary = nearbySummaryForLocation(book, locResult.address);
+                                  });
+                                }
+                              } else {
+                                if (context.mounted) {
+                                  setModalState(() {
+                                    locationController.text = '';
+                                  });
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(content: Text('无法获取位置，请检查定位权限或GPS是否开启。')),
+                                  );
+                                }
+                              }
+                            } catch (_) {
+                              if (context.mounted) {
+                                setModalState(() {
+                                  locationController.text = '';
+                                });
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text('定位失败，请稍后重试。')),
+                                );
+                              }
+                            }
+                          },
+                        ),
+                      ],
+                    ),
                   ),
                 ),
+                if (nearbySummary.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE8EAF6),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.info_outline, size: 16, color: Color(0xFF5C6BC0)),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              nearbySummary,
+                              style: GoogleFonts.plusJakartaSans(
+                                fontSize: 12,
+                                color: const Color(0xFF3F51B5),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                 const SizedBox(height: 12),
                 TextField(
                   controller: noteController,
@@ -8851,6 +9350,8 @@ Future<void> showEntrySheet(
                                 occurredAt: occurredAt,
                                 tags: parsedTags,
                                 locationInfo: locationController.text.trim(),
+                                latitude: locationController.text.trim().isEmpty ? null : entryLat,
+                                longitude: locationController.text.trim().isEmpty ? null : entryLon,
                                 mood: selectedMood,
                                 autoCaptured: false,
                                 sourceLabel: '',
@@ -8869,6 +9370,8 @@ Future<void> showEntrySheet(
                           occurredAt: occurredAt,
                           tags: parsedTags,
                           locationInfo: locationController.text.trim(),
+                          latitude: locationController.text.trim().isEmpty ? null : entryLat,
+                          longitude: locationController.text.trim().isEmpty ? null : entryLon,
                           mood: selectedMood,
                         );
                         final protected = edited.copyWith(
