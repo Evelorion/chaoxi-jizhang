@@ -1,100 +1,169 @@
-# 潮汐账本
+# 潮汐账本 (Chaoxi Jizhang)
 
-一款面向日常生活场景的 Flutter 安卓记账应用。它把自动记账、预算目标、命名账期、洞察分析和本地加密放在同一个应用里，重点不是“做一套好看的空 UI”，而是把真实可用的记账流程做完整。
+> 一款为中文用户打造的智能个人记账 App，基于 Flutter 开发，支持自动记账、位置智能化、AI 分析洞察，数据本地加密存储。
 
-## 🎉 最强智能化大航海升级 (v2.0 AI Evolution)
+<p align="center">
+  <a href="https://github.com/Evelorion/chaoxi-jizhang/releases/latest">
+    <img src="https://img.shields.io/github/v/release/Evelorion/chaoxi-jizhang?label=最新版本&color=5C6BC0" alt="Latest Release"/>
+  </a>
+  <img src="https://img.shields.io/badge/平台-Android-3DDC84?logo=android" alt="Android"/>
+  <img src="https://img.shields.io/badge/Flutter-3.x-54C5F8?logo=flutter" alt="Flutter"/>
+  <img src="https://img.shields.io/badge/数据-本地加密-orange" alt="Local Encryption"/>
+</p>
 
-本项目现已全面接入本地 AI 与离线智能辅助分析系统：
-- **纯血离线 STT 录音引擎与自然语义提取 (NLP)**：支持无唤醒直接按住首页侧边悬浮浮窗收录人声（附带无缝 AI 文本兜底输入）。对着手机说“昨天在全家买水花了5块”，APP 将通过纯本地引擎秒解构出日期、商户、分类及金额，一键“零阻力”入账。
-- **动态防刺客订阅雷达 (Subscription Radar)**：底层算法全局扫描长达 120 天的历史流水，自动在月底拦截暗处的自动续费、连续包月扣款，强效护眼并守护钱包。
-- **天气预报级烧钱风控中心 (Burn-rate Predictor)**：根据用户近期的频次与力度模型预测预算干涸天数，“照这个造法，餐饮池将在 3 天后见怪”，让你对支出把持得一清二楚。
-- **治愈系情绪消费热图 (Mood Analysis)**：引入独具情感温度的记录流。现在无论你是否激动，点上“开心/冲动/心累”，系统月底帮你具象化你的“情绪买单金额”。
-- **全面重构的资金池系统 (Asset Pools)**：剥离旧有繁杂交互，采用全顺滑弹性动画（ElasticOut），支持实时编辑余额与类型映射，容错拉满。
+---
 
-## 现在能做什么
+## 📥 下载安装
 
-- 自动记账：通过系统通知读取微信、支付宝、Google Pay、淘宝、京东、拼多多、闲鱼等支付/订单提示，并尽量合并成一条主支付记录。
-- 流水管理：支持搜索、筛选、编辑、删除、账期归类，以及自动识别付款人/收款方名字。
-- 计划能力：支持预算信封、生活目标、固定支出计划、命名账期。
-- 洞察分析：提供近六个月现金流、分类结构、生活维度热力表和关键判断。
-- 隐私与安全：账本默认保存在本机，Android 侧使用标准 AES-GCM 加密，支持指纹解锁、禁止截屏、本地加密备份导入导出。
+**[→ 点击下载最新版 APK](https://github.com/Evelorion/chaoxi-jizhang/releases/latest)**
 
-## 下载
+> 下载 `app-release.apk`，安装时需在手机上允许「未知来源」应用安装。
 
-- 最新版本：见 [Releases](https://github.com/Evelorion/chaoxi-jizhang/releases/latest)
-- 当前仓库默认提供 `arm64-v8a` Android Release APK
+---
 
-## 页面预览
+## ✨ 核心功能
+
+### 🤖 自动记账
+- 监听微信、支付宝、Google Pay、京东、淘宝、拼多多、闲鱼支付通知，**自动抓取金额和商家**
+- 智能合并重复通知，避免重复记录
+- 可自定义各渠道的分类规则
+
+### 📍 位置智能化（v2.1.0 新增）
+- **秒级定位**：优先使用 OS 缓存位置，无需等待 GPS
+- **国内可用**：使用 BigDataCloud + ip-api.com，不依赖 Nominatim，稳定返回中文地址
+- **IP 辅助定位**：GPS 不可用时自动走网络定位（城市级精度）
+- **自动记账记录位置**：自动记账时可选择异步附加当前位置
+- **常用地点管理**：收藏高频消费地点，自动匹配模板
+
+### 🎙️ 语音速记
+- 长按麦克风按钮语音输入，支持中文自然语言解析
+- 自动识别金额、分类、商家、备注
+
+### 📊 洞察分析
+- 月度收支趋势、分类占比图表
+- 区域消费分布（基于定位数据）
+- 订阅雷达：识别并追踪周期性支出
+- 燃烧率预测：预估月底结余
+
+### 🔐 隐私与安全
+- 所有数据本地存储，**不上传任何云端**
+- AES-GCM 加密落盘，机密模式支持金额遮罩
+- 生物识别解锁（指纹/面容）
+- 后台自动锁定
+
+### 💰 预算与目标
+- 自定义月度预算，实时进度追踪
+- 设定储蓄/消费目标，可视化达成进度
+
+### 🔄 订阅管理
+- 识别月租、年费等周期性账单
+- 到期提醒，避免忘记续费
+
+---
+
+## 🆕 v2.1.0 更新日志
+
+### 新增功能
+- **IP 辅助定位**：GPS 不可用时自动通过网络 IP 获取位置
+- **自动记账定位开关**：设置 → 位置记账助手，可选是否在自动记账时记录位置
+- **并行定位竞争**：GPS 和 IP 定位同时发起，谁先返回用谁，提升速度
+
+### Bug 修复
+- 修复 Nominatim 在中国大陆不可达导致的定位失败，改用 BigDataCloud
+- 修复定位等待时 UI 卡顿（转圈）问题
+- 修复关闭记账表单后定位回调触发的 `setState-after-dispose` 崩溃
+- 修复 Release APK 因缺少签名配置无法构建的问题
+
+[查看完整 Release Notes →](https://github.com/Evelorion/chaoxi-jizhang/releases/tag/v2.1.0)
+
+---
+
+## 🏗️ 技术栈
+
+| 层级 | 技术 |
+|------|------|
+| UI 框架 | Flutter 3 / Dart |
+| 状态管理 | Riverpod |
+| Android 原生 | Kotlin（通知监听服务） |
+| 图表 | fl_chart |
+| 定位 | geolocator + BigDataCloud + ip-api.com |
+| 加密 | AES-GCM（Android Keystore） |
+| 生物识别 | local_auth |
+| 存储 | flutter_secure_storage |
+
+---
+
+## 📂 项目结构
+
+```
+lib/
+  main.dart
+  src/
+    app.dart                    核心控制器 & 全部 UI
+    location_helper.dart        位置获取、反向地理编码
+    ui_location_map.dart        消费地图可视化
+    ui_voice_fab.dart           语音速记浮动按钮
+android/app/src/main/kotlin/
+  .../MainActivity.kt
+  .../LedgerNotificationListenerService.kt   通知监听
+  .../NotificationParser.kt                  金额解析
+  .../VaultCipher.kt                         加密层
+test/
+  ledger_book_test.dart         单元测试
+```
+
+---
+
+## 🔧 本地开发
+
+```bash
+# 安装依赖
+flutter pub get
+
+# 代码检查
+flutter analyze
+
+# 运行测试
+flutter test
+
+# 调试运行
+flutter run
+
+# 打包 Release APK
+flutter build apk --release
+```
+
+> **注意**：如需正式签名，将 `key.properties` 放置于 `android/` 目录，否则自动使用 debug 签名构建。
+
+---
+
+## 📸 应用截图
 
 <table>
   <tr>
     <td align="center">
-      <img src="docs/screenshots/overview.jpg" width="260" alt="总览页" />
-      <div><strong>总览</strong><br/>看本月净结余、生活覆盖和自动记账进展</div>
+      <img src="docs/screenshots/overview.jpg" width="220" alt="首页总览"/>
+      <div><strong>首页</strong><br/>收支汇总 · 快速记账</div>
     </td>
     <td align="center">
-      <img src="docs/screenshots/transactions.jpg" width="260" alt="流水页" />
-      <div><strong>流水</strong><br/>搜索、筛选、编辑和追踪每一笔流水来源</div>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <img src="docs/screenshots/plans.jpg" width="260" alt="计划页" />
-      <div><strong>计划</strong><br/>预算、目标、账期和固定计划统一管理</div>
+      <img src="docs/screenshots/transactions.jpg" width="220" alt="流水明细"/>
+      <div><strong>流水</strong><br/>筛选 · 自动记账 · 来源追溯</div>
     </td>
     <td align="center">
-      <img src="docs/screenshots/insights.jpg" width="260" alt="洞察页" />
-      <div><strong>洞察</strong><br/>用结构图和现金流趋势把钱放回生活语境里看</div>
+      <img src="docs/screenshots/insights.jpg" width="220" alt="洞察分析"/>
+      <div><strong>洞察</strong><br/>图表 · 区域分布 · 预测</div>
     </td>
   </tr>
 </table>
 
-## 技术栈
+---
 
-- Flutter 3 / Dart
-- Android Kotlin 通知监听服务
-- Riverpod 状态管理
-- fl_chart 数据可视化
-- local_auth / flutter_secure_storage 本地生物识别与安全存储
+## 📄 许可证
 
-## 本地运行
+本项目仅供个人学习与使用，暂未开放商业授权。
 
-```bash
-flutter pub get
-flutter analyze
-flutter test
-flutter run
-```
+---
 
-## Android 打包
-
-```bash
-flutter build apk --release --split-per-abi
-```
-
-默认产物位置：
-
-- `build/app/outputs/flutter-apk/app-arm64-v8a-release.apk`
-- `build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk`
-- `build/app/outputs/flutter-apk/app-x86_64-release.apk`
-
-## 项目结构
-
-```text
-lib/
-  main.dart
-  src/app.dart                  Flutter 主界面、数据模型、控制器
-android/app/src/main/kotlin/
-  .../MainActivity.kt          Android 原生桥接
-  .../LedgerNotificationListenerService.kt
-  .../NotificationParser.kt    自动记账通知解析
-  .../VaultCipher.kt           Android 本地加密
-test/
-  ledger_book_test.dart        账本与序列化回归测试
-```
-
-## 当前重点
-
-- 优化总览到收入/支出详情页的转场与返回性能
-- 继续提升微信/支付宝转账通知的人名和方向识别
-- 完善 Release 发布流程和版本说明
+<p align="center">
+  <strong>潮汐账本</strong> · 让记账像潮水一样自然
+</p>
