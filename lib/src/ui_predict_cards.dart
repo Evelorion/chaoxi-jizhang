@@ -195,7 +195,7 @@ class SubscriptionRadarCard extends StatelessWidget {
                     const SizedBox(height: 6),
                     ...upcomingList.map((t) => Padding(
                       padding: const EdgeInsets.only(top: 4.0),
-                      child: Text('⚠️ ' + t, style: GoogleFonts.plusJakartaSans(fontSize: 13, height: 1.5, color: const Color(0xFF424242))),
+                      child: Text('\u26a0\ufe0f $t', style: GoogleFonts.plusJakartaSans(fontSize: 13, height: 1.5, color: const Color(0xFF424242))),
                     )).toList(),
                     const SizedBox(height: 6),
                     Text('请确认服务是否需要，防患于未然！', style: GoogleFonts.plusJakartaSans(fontSize: 12, fontWeight: FontWeight.w600, color: const Color(0xFFC2185B))),
