@@ -10,7 +10,6 @@ import 'package:collection/collection.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
-import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_riverpod/legacy.dart';
@@ -19,12 +18,15 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart' as ph;
 import 'package:uuid/uuid.dart';
+import 'package:geolocator/geolocator.dart';
 
 part 'ui_extensions.dart';
 part 'ui_predict_cards.dart';
 part 'nlp_engine.dart';
 part 'ui_voice_fab.dart';
+part 'location_helper.dart';
 
 const _uuid = Uuid();
 const _ledgerFileName = 'chaoxi_vault.enc';
@@ -257,7 +259,7 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
           children: [
             const _AmbientBackground(),
             SafeArea(child: _buildStateBody(context, state)),
-            if (_selectedIndex == 0 && state.book != null)
+            if (_selectedIndex == 0 && state.book != null && state.book!.settings.voiceInputEnabled)
               VoiceRecordingFab(book: state.book!, controller: ref.read(ledgerControllerProvider.notifier)),
           ],
         ),
@@ -482,6 +484,20 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     }
   }
 
+  Future<void> resetVault() async {
+    try {
+      await _repository.deleteVault();
+      state = state.copyWith(
+        onboardingRequired: true,
+        locked: false,
+        book: null,
+        errorMessage: null,
+      );
+    } catch (e) {
+      state = state.copyWith(errorMessage: '重置失败：$e');
+    }
+  }
+
   void clearNoticeMessage(String expected) {
     if (state.noticeMessage != expected) {
       return;
@@ -583,15 +599,24 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     final passphrase = _sessionPassphrase;
     if (book == null || passphrase == null) return;
 
+    // Auto-inject location if not already set
+    var finalEntry = entry;
+    if (entry.locationInfo.isEmpty) {
+      final loc = await LocationHelper.getCurrentLocation();
+      if (loc.isNotEmpty) {
+        finalEntry = entry.copyWith(locationInfo: loc);
+      }
+    }
+
     final updated = book.copyWith(
-      entries: [...book.entries, entry]
+      entries: [...book.entries, finalEntry]
         ..sort((a, b) => b.occurredAt.compareTo(a.occurredAt)),
       updatedAt: DateTime.now(),
     );
     await _persistBook(
       updated,
       passphrase,
-      notice: '已添加一笔${entry.type.label}。',
+      notice: '已添加一笔${finalEntry.type.label}。',
     );
   }
 
@@ -822,7 +847,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         (entry) => entry.id == capture.id,
       );
       if (sameIdIndex != -1) {
-        workingEntries[sameIdIndex] = _mergeEntryWithCapture(
+        workingEntries[sameIdIndex] = await _mergeEntryWithCapture(
           workingEntries[sameIdIndex],
           capture,
           book,
@@ -833,7 +858,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
 
       final mergeIndex = _findMergeTargetIndex(workingEntries, capture);
       if (mergeIndex != -1) {
-        workingEntries[mergeIndex] = _mergeEntryWithCapture(
+        workingEntries[mergeIndex] = await _mergeEntryWithCapture(
           workingEntries[mergeIndex],
           capture,
           book,
@@ -842,7 +867,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         continue;
       }
 
-      final candidate = _captureToEntry(capture, book);
+      final candidate = await _captureToEntry(capture, book);
       if (_containsSimilarAutoEntry(workingEntries, candidate)) {
         continue;
       }
@@ -876,7 +901,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     );
   }
 
-  LedgerEntry _captureToEntry(AutoCaptureRecord capture, LedgerBook book) {
+  Future<LedgerEntry> _captureToEntry(AutoCaptureRecord capture, LedgerBook book) async {
     final inferred = inferAutoCaptureCategoryId(
       book: book,
       capture: capture,
@@ -917,6 +942,12 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         '${capture.source.label}入账',
     }.toList();
 
+    // Try to get current location for auto-captured entries
+    String autoLocation = '';
+    try {
+      autoLocation = await LocationHelper.getCurrentLocation();
+    } catch (_) {}
+
     return LedgerEntry(
       id: capture.id,
       title: buildAutoCaptureDisplayTitle(
@@ -944,6 +975,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         ...customTags,
         if (capture.confidence >= 0.85) '高置信度',
       ],
+      locationInfo: autoLocation,
       autoCaptured: true,
       sourceLabel: capture.source.label,
       autoMergeKey: capture.mergeKey,
@@ -961,6 +993,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       CaptureSource.jd => settings.jdEnabled,
       CaptureSource.pinduoduo => settings.pinduoduoEnabled,
       CaptureSource.xianyu => settings.xianyuEnabled,
+      CaptureSource.bank => settings.bankEnabled,
       CaptureSource.unknown => false,
     };
   }
@@ -969,7 +1002,8 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     List<LedgerEntry> entries,
     AutoCaptureRecord capture,
   ) {
-    return entries.lastIndexWhere((entry) {
+    // --- Strategy 1: Exact match (same amount, tight window) ---
+    final exactMatch = entries.lastIndexWhere((entry) {
       if (!entry.autoCaptured) return false;
       if (entry.autoProfileId != capture.profileId) return false;
       if (entry.type != capture.entryType) return false;
@@ -977,6 +1011,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       final delta = (_entryEventMillis(entry) - capture.postedAtMillis).abs();
       if (delta > const Duration(minutes: 10).inMilliseconds) return false;
 
+      // mergeKey match
       if (entry.autoMergeKey.isNotEmpty && capture.mergeKey.isNotEmpty) {
         if (entry.autoMergeKey == capture.mergeKey ||
             entry.autoMergeKey.contains(capture.mergeKey) ||
@@ -985,6 +1020,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         }
       }
 
+      // counterparty name match
       if (entry.counterpartyName.isNotEmpty &&
           capture.counterpartyName.isNotEmpty &&
           (entry.counterpartyName == capture.counterpartyName ||
@@ -993,6 +1029,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         return true;
       }
 
+      // Cross-source match (e.g. taobao notification + wechat payment)
       final existingSource = CaptureSource.fromLabelOrUnknown(
         entry.sourceLabel,
       );
@@ -1000,14 +1037,82 @@ class LedgerController extends StateNotifier<LedgerViewState> {
           existingSource != capture.source &&
           (existingSource.isPaymentSource != capture.source.isPaymentSource);
     });
+    if (exactMatch != -1) return exactMatch;
+
+    // --- Strategy 2: Cross-source enrichment (shopping → payment or vice versa) ---
+    // When you buy on Taobao, you first get a Taobao notification (with store name),
+    // then a WeChat/Alipay payment notification (with amount). These should merge.
+    // We use a wider time window (30 mins) and allow amount mismatch when one side
+    // is a shopping source and the other is a payment source.
+    final isCaptureFromPayment = capture.source.isPaymentSource;
+    final isCaptureFromShopping = capture.source.isShoppingSource;
+
+    if (isCaptureFromPayment || isCaptureFromShopping) {
+      final crossMatch = entries.lastIndexWhere((entry) {
+        if (!entry.autoCaptured) return false;
+        if (entry.autoProfileId != capture.profileId) return false;
+        if (entry.type != capture.entryType) return false;
+
+        final existingSource = CaptureSource.fromLabelOrUnknown(entry.sourceLabel);
+        if (existingSource == CaptureSource.unknown) return false;
+        if (existingSource == capture.source) return false;
+
+        // Must be a shopping↔payment pair
+        final isValidPair =
+            (isCaptureFromPayment && existingSource.isShoppingSource) ||
+            (isCaptureFromShopping && existingSource.isPaymentSource);
+        if (!isValidPair) return false;
+
+        // Tight time window for cross-source: 90 seconds (notifications arrive almost together)
+        final delta = (_entryEventMillis(entry) - capture.postedAtMillis).abs();
+        if (delta > const Duration(seconds: 90).inMilliseconds) return false;
+
+        // Amount match (if both have amounts, they should be close)
+        if (capture.amount > 0 && entry.amount > 0) {
+          if ((entry.amount - capture.amount).abs() > 0.5) return false;
+        }
+
+        // mergeKey / merchant fuzzy match
+        if (entry.autoMergeKey.isNotEmpty && capture.mergeKey.isNotEmpty) {
+          if (entry.autoMergeKey == capture.mergeKey ||
+              entry.autoMergeKey.contains(capture.mergeKey) ||
+              capture.mergeKey.contains(entry.autoMergeKey)) {
+            return true;
+          }
+        }
+
+        // Merchant name fuzzy match
+        if (entry.merchant.isNotEmpty && capture.merchant.isNotEmpty) {
+          final eMerchant = entry.merchant.toLowerCase();
+          final cMerchant = capture.merchant.toLowerCase();
+          if (eMerchant == cMerchant ||
+              eMerchant.contains(cMerchant) ||
+              cMerchant.contains(eMerchant)) {
+            return true;
+          }
+        }
+
+        // If amounts match exactly and it's a valid cross-source pair,
+        // that's enough evidence to merge
+        if (capture.amount > 0 && entry.amount > 0 &&
+            (entry.amount - capture.amount).abs() < 0.01) {
+          return true;
+        }
+
+        return false;
+      });
+      if (crossMatch != -1) return crossMatch;
+    }
+
+    return -1;
   }
 
-  LedgerEntry _mergeEntryWithCapture(
+  Future<LedgerEntry> _mergeEntryWithCapture(
     LedgerEntry existing,
     AutoCaptureRecord capture,
     LedgerBook book,
-  ) {
-    final candidate = _captureToEntry(capture, book);
+  ) async {
+    final candidate = await _captureToEntry(capture, book);
     final existingSource = CaptureSource.fromLabelOrUnknown(
       existing.sourceLabel,
     );
@@ -1020,11 +1125,23 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         promoteCapture || existing.channel == PaymentChannel.other
         ? candidate.channel
         : existing.channel;
-    final mergedMerchant = _pickPreferredText(
-      existing: existing.merchant,
-      incoming: candidate.merchant,
-      preferIncoming: promoteCapture,
-    );
+    // Smart merchant picking: shopping sources (Taobao/JD/PDD) typically have
+    // the real store name, while payment sources (WeChat/Alipay) often just say
+    // "未识别商户". Always prefer the shopping source's richer merchant info.
+    final incomingIsRicher = capture.source.isShoppingSource && existingSource.isPaymentSource;
+    final existingIsRicher = existingSource.isShoppingSource && capture.source.isPaymentSource;
+    final String mergedMerchant;
+    if (incomingIsRicher && candidate.merchant.isNotEmpty && candidate.merchant != '未识别商户') {
+      mergedMerchant = candidate.merchant;
+    } else if (existingIsRicher && existing.merchant.isNotEmpty && existing.merchant != '未识别商户') {
+      mergedMerchant = existing.merchant;
+    } else {
+      mergedMerchant = _pickPreferredText(
+        existing: existing.merchant,
+        incoming: candidate.merchant,
+        preferIncoming: promoteCapture,
+      );
+    }
     final mergedCounterpartyName = _pickPreferredText(
       existing: existing.counterpartyName,
       incoming: candidate.counterpartyName,
@@ -1419,6 +1536,13 @@ class LedgerVaultRepository {
     }
     return book;
   }
+
+  Future<void> deleteVault() async {
+    final file = await _vaultFile();
+    if (await file.exists()) await file.delete();
+    final legacyFile = await _legacyVaultFile();
+    if (await legacyFile.exists()) await legacyFile.delete();
+  }
 }
 
 class VaultCryptoBridge {
@@ -1685,6 +1809,7 @@ enum CaptureSource {
   jd('京东'),
   pinduoduo('拼多多'),
   xianyu('闲鱼'),
+  bank('银行卡'),
   unknown('未知');
 
   const CaptureSource(this.label);
@@ -2310,6 +2435,8 @@ class VaultSettings {
     required this.jdEnabled,
     required this.pinduoduoEnabled,
     required this.xianyuEnabled,
+    required this.bankEnabled,
+    this.voiceInputEnabled = true,
     this.locationMode = LocationTrackingMode.off,
   });
 
@@ -2327,6 +2454,8 @@ class VaultSettings {
   final bool jdEnabled;
   final bool pinduoduoEnabled;
   final bool xianyuEnabled;
+  final bool bankEnabled;
+  final bool voiceInputEnabled;
   final LocationTrackingMode locationMode;
 
   Map<String, dynamic> toJson() => {
@@ -2344,6 +2473,8 @@ class VaultSettings {
     'jdEnabled': jdEnabled,
     'pinduoduoEnabled': pinduoduoEnabled,
     'xianyuEnabled': xianyuEnabled,
+    'bankEnabled': bankEnabled,
+    'voiceInputEnabled': voiceInputEnabled,
     'locationMode': locationMode.name,
   };
 
@@ -2363,6 +2494,8 @@ class VaultSettings {
     jdEnabled: json['jdEnabled'] as bool? ?? true,
     pinduoduoEnabled: json['pinduoduoEnabled'] as bool? ?? true,
     xianyuEnabled: json['xianyuEnabled'] as bool? ?? true,
+    bankEnabled: json['bankEnabled'] as bool? ?? true,
+    voiceInputEnabled: json['voiceInputEnabled'] as bool? ?? true,
     locationMode: LocationTrackingMode.values.firstWhere((e) => e.name == (json['locationMode'] as String?), orElse: () => LocationTrackingMode.off),
   );
 
@@ -2381,6 +2514,8 @@ class VaultSettings {
     bool? jdEnabled,
     bool? pinduoduoEnabled,
     bool? xianyuEnabled,
+    bool? bankEnabled,
+    bool? voiceInputEnabled,
     LocationTrackingMode? locationMode,
   }) {
     return VaultSettings(
@@ -2402,6 +2537,8 @@ class VaultSettings {
       jdEnabled: jdEnabled ?? this.jdEnabled,
       pinduoduoEnabled: pinduoduoEnabled ?? this.pinduoduoEnabled,
       xianyuEnabled: xianyuEnabled ?? this.xianyuEnabled,
+      bankEnabled: bankEnabled ?? this.bankEnabled,
+      voiceInputEnabled: voiceInputEnabled ?? this.voiceInputEnabled,
       locationMode: locationMode ?? this.locationMode,
     );
   }
@@ -2456,6 +2593,8 @@ class LedgerBook {
         jdEnabled: true,
         pinduoduoEnabled: true,
         xianyuEnabled: true,
+        bankEnabled: true,
+        voiceInputEnabled: true,
       ),
     );
   }
@@ -2733,6 +2872,8 @@ class LedgerBook {
         jdEnabled: true,
         pinduoduoEnabled: true,
         xianyuEnabled: true,
+        bankEnabled: true,
+        voiceInputEnabled: true,
       ),
     );
   }
@@ -5266,7 +5407,8 @@ class _VaultUnlockScreenState extends ConsumerState<_VaultUnlockScreen> {
       duration: const Duration(milliseconds: 220),
       curve: Curves.easeOutCubic,
       padding: EdgeInsets.only(bottom: bottomInset),
-      child: Center(
+      child: SingleChildScrollView(
+        child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 460),
           child: Padding(
@@ -5364,11 +5506,55 @@ class _VaultUnlockScreenState extends ConsumerState<_VaultUnlockScreen> {
                       ),
                     ),
                   ],
+                  const SizedBox(height: 16),
+                  TextButton(
+                    onPressed: () => _confirmReset(context, controller),
+                    child: const Text(
+                      '忘记口令？重置账本',
+                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                    ),
+                  ),
+                  if (state.errorMessage != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Text(
+                        state.errorMessage!,
+                        style: const TextStyle(color: Colors.redAccent, fontSize: 13),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
                 ],
               ),
             ),
           ),
         ),
+        ),
+      ),
+    );
+  }
+
+  void _confirmReset(BuildContext context, LedgerController controller) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('重置账本'),
+        content: const Text(
+          '警告：此操作将永久删除所有账本数据，包括所有流水记录、预算\n和设置。删除后无法恢复。\n\n确定要重置吗？',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () {
+              Navigator.pop(ctx);
+              controller.resetVault();
+            },
+            child: const Text('确认重置'),
+          ),
+        ],
       ),
     );
   }
@@ -5729,6 +5915,8 @@ class _EntryTile extends StatelessWidget {
                   const SizedBox(height: 4),
                   Text(
                     buildEntryMetaLine(entry, periodLabel: periodLabel),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
                     style: GoogleFonts.plusJakartaSans(
                       fontSize: 12,
                       color: const Color(0xFF7A869C),
@@ -5762,7 +5950,14 @@ class _EntryTile extends StatelessWidget {
                               children: [
                                 const Icon(Icons.location_on, size: 11, color: Color(0xFF5C6BC0)),
                                 const SizedBox(width: 2),
-                                Text(entry.locationInfo, style: GoogleFonts.plusJakartaSans(fontSize: 11, fontWeight: FontWeight.w600, color: const Color(0xFF5C6BC0))),
+                                Flexible(
+                                  child: Text(
+                                    entry.locationInfo,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: GoogleFonts.plusJakartaSans(fontSize: 11, fontWeight: FontWeight.w600, color: const Color(0xFF5C6BC0)),
+                                  ),
+                                ),
                               ],
                             ),
                           ),
@@ -7883,7 +8078,32 @@ class VaultScreen extends ConsumerWidget {
                         book.settings.copyWith(xianyuEnabled: value),
                       ),
                     ),
+                    _SourceSwitchTile(
+                      title: '银行卡通知',
+                      value: book.settings.bankEnabled,
+                      subtitle: '工行/建行/农行/中行/交行/邮储等银行 APP 通知',
+                      onChanged: (value) => controller.updateSettings(
+                        book.settings.copyWith(bankEnabled: value),
+                      ),
+                    ),
                   ],
+                ),
+              ),
+              const SizedBox(height: 22),
+              _SectionHeader(
+                title: '语音输入',
+                actionLabel: '',
+                onTap: null,
+              ),
+              const SizedBox(height: 12),
+              _GlassCard(
+                child: _SourceSwitchTile(
+                  title: '语音/文字速记',
+                  value: book.settings.voiceInputEnabled,
+                  subtitle: '开启后主页显示语音输入按钮，支持离线中文语音识别',
+                  onChanged: (value) => controller.updateSettings(
+                    book.settings.copyWith(voiceInputEnabled: value),
+                  ),
                 ),
               ),
 
@@ -8394,6 +8614,9 @@ Future<void> showEntrySheet(
   final tagsController = TextEditingController(
     text: initialEntry?.tags.join('，') ?? '',
   );
+  final locationController = TextEditingController(
+    text: initialEntry?.locationInfo ?? '',
+  );
   var type = initialType;
   var channel = initialEntry?.channel ?? PaymentChannel.wechatPay;
   var selectedMood = initialEntry?.mood ?? ExpenseMood.none;
@@ -8497,6 +8720,14 @@ Future<void> showEntrySheet(
                 TextField(
                   controller: tagsController,
                   decoration: const InputDecoration(labelText: '标签（用逗号分隔）'),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: locationController,
+                  decoration: const InputDecoration(
+                    labelText: '地址 / 位置',
+                    prefixIcon: Icon(Icons.location_on_outlined),
+                  ),
                 ),
                 const SizedBox(height: 12),
                 TextField(
@@ -8619,6 +8850,7 @@ Future<void> showEntrySheet(
                                 channel: channel,
                                 occurredAt: occurredAt,
                                 tags: parsedTags,
+                                locationInfo: locationController.text.trim(),
                                 mood: selectedMood,
                                 autoCaptured: false,
                                 sourceLabel: '',
@@ -8636,6 +8868,7 @@ Future<void> showEntrySheet(
                           channel: channel,
                           occurredAt: occurredAt,
                           tags: parsedTags,
+                          locationInfo: locationController.text.trim(),
                           mood: selectedMood,
                         );
                         final protected = edited.copyWith(
