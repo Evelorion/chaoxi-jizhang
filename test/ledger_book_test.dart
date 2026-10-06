@@ -376,7 +376,7 @@ void main() {
       counterpartyName: '',
       rawBody: rawBody,
       scenario: 'merchantPayment',
-      detailSummary: detail.isEmpty ? '' : '商家：' + detail,
+      detailSummary: detail.isEmpty ? '' : '商家：$detail',
       amount: 35,
       entryType: EntryType.expense,
       channel: PaymentChannel.wechatPay,

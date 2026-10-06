@@ -223,7 +223,7 @@ LedgerQueryOutcome runLedgerQuery(
     final categoryCount = bucket.categoryCounts[spec.categoryId] ?? 0;
     return LedgerQueryOutcome(
       text:
-          '$scope共${categoryCount}笔，收入0.00元，支出${expense.toStringAsFixed(2)}元。',
+          '$scope共$categoryCount笔，收入0.00元，支出${expense.toStringAsFixed(2)}元。',
       entryIds: const [],
     );
   }
