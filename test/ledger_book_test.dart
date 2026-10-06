@@ -1,5 +1,19 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jier/src/app.dart';
+
+class _FailingVaultRepository extends LedgerVaultRepository {
+  const _FailingVaultRepository() : super(const VaultCryptoBridge());
+
+  @override
+  Future<bool> vaultExists() async => false;
+
+  @override
+  Future<void> save(LedgerBook book, String passphrase) async {
+    throw const FileSystemException('storage full');
+  }
+}
 
 void main() {
   test('legacy vault settings default biometric unlock to false', () {
@@ -24,6 +38,25 @@ void main() {
     expect(book.subscriptions, isEmpty);
     expect(book.settings.confidentialModeEnabled, isTrue);
     expect(book.settings.allowScreenshots, isTrue);
+  });
+
+  test('vault creation stays on setup when saving fails', () async {
+    final controller = LedgerController(
+      const _FailingVaultRepository(),
+      const AndroidAutoCaptureBridge(),
+      const AndroidWindowPrivacyBridge(),
+      BiometricVaultBridge(),
+    );
+    await controller.initialize();
+    await controller.createVault(
+      passphrase: 'test-passphrase',
+      confidentialModeEnabled: true,
+    );
+    expect(controller.state.onboardingRequired, isTrue);
+    expect(controller.state.book, isNull);
+    expect(controller.state.canShowShell, isFalse);
+    expect(controller.state.errorMessage, contains('保存失败'));
+    controller.dispose();
   });
 
   test('legacy seeded content is removed while real records stay', () {

@@ -210,7 +210,7 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
         next.noticeMessage != previous?.noticeMessage) {
       _noticeTimer?.cancel();
       final notice = next.noticeMessage!;
-      _noticeTimer = Timer(const Duration(milliseconds: 1220), () {
+      _noticeTimer = Timer(const Duration(seconds: 4), () {
         if (!mounted) return;
         ref.read(ledgerControllerProvider.notifier).clearNoticeMessage(notice);
       });
@@ -219,7 +219,7 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
         next.errorMessage != previous?.errorMessage) {
       _errorTimer?.cancel();
       final error = next.errorMessage!;
-      _errorTimer = Timer(const Duration(milliseconds: 1220), () {
+      _errorTimer = Timer(const Duration(seconds: 7), () {
         if (!mounted) return;
         ref.read(ledgerControllerProvider.notifier).clearErrorMessage(error);
       });
@@ -426,7 +426,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     }
 
     final emptyBook = LedgerBook.empty(confidentialModeEnabled);
-    await _persistNewBook(emptyBook, passphrase);
+    if (!await _persistNewBook(emptyBook, passphrase)) return;
     state = state.copyWith(
       onboardingRequired: false,
       locked: false,
@@ -471,6 +471,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       await _syncBiometricPassphrase(book.settings, passphrase.trim());
       await syncAutoCapturedEntries(silent: true);
     } catch (_) {
+      _sessionPassphrase = null;
       state = state.copyWith(busy: false, errorMessage: '口令不正确，或保险库数据无法解密。');
       if (triggeredByBiometric) {
         await _biometricVaultBridge.clearPassphrase();
@@ -499,10 +500,13 @@ class LedgerController extends StateNotifier<LedgerViewState> {
   Future<void> resetVault() async {
     try {
       await _repository.deleteVault();
+      _sessionPassphrase = null;
       state = state.copyWith(
         onboardingRequired: true,
         locked: false,
         book: null,
+        canUseShell: false,
+        revealAmounts: false,
         errorMessage: null,
       );
     } catch (e) {
@@ -553,7 +557,9 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       updatedAt: DateTime.now(),
     );
     await _persistBook(updated, passphrase, notice: '机密设置已更新。');
-    await _syncBiometricPassphrase(settings, passphrase);
+    if (identical(state.book, updated)) {
+      await _syncBiometricPassphrase(settings, passphrase);
+    }
   }
 
   Future<void> updateBook(LedgerBook book) async {
@@ -1473,9 +1479,11 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     });
   }
 
-  Future<void> _persistNewBook(LedgerBook book, String passphrase) async {
-    _sessionPassphrase = passphrase.trim();
+  Future<bool> _persistNewBook(LedgerBook book, String passphrase) async {
     await _persistBook(book, passphrase.trim(), notice: '保险库已创建。');
+    if (!identical(state.book, book)) return false;
+    _sessionPassphrase = passphrase.trim();
+    return true;
   }
 
   Future<void> _persistBook(
@@ -1561,7 +1569,9 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         passphrase,
         notice: '本地 JSON 备份已导入，当前内容已替换为导入版本。',
       );
-      await _syncBiometricPassphrase(importedBook.settings, passphrase);
+      if (identical(state.book, importedBook)) {
+        await _syncBiometricPassphrase(importedBook.settings, passphrase);
+      }
     } catch (error) {
       state = state.copyWith(
         busy: false,
@@ -1654,7 +1664,9 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         passphrase,
         notice: '加密备份已导入，当前内容已替换为导入版本。',
       );
-      await _syncBiometricPassphrase(importedBook.settings, passphrase);
+      if (identical(state.book, importedBook)) {
+        await _syncBiometricPassphrase(importedBook.settings, passphrase);
+      }
     } catch (error) {
       state = state.copyWith(
         busy: false,
@@ -5066,46 +5078,16 @@ class _LifePillarInsight {
   final List<String> activeCategories;
 }
 
-class _AmbientBackground extends StatefulWidget {
+class _AmbientBackground extends StatelessWidget {
   const _AmbientBackground();
 
   @override
-  State<_AmbientBackground> createState() => _AmbientBackgroundState();
-}
-
-class _AmbientBackgroundState extends State<_AmbientBackground>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller;
-  late final CurvedAnimation _curve;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 20),
-    )..repeat(reverse: true);
-    _curve = CurvedAnimation(parent: _controller, curve: Curves.easeInOut);
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    return IgnorePointer(
+    return const IgnorePointer(
       child: RepaintBoundary(
-        child: AnimatedBuilder(
-          animation: _curve,
-          builder: (context, child) {
-            return CustomPaint(
-              painter: _AmbientBackgroundPainter(progress: _curve.value),
-              child: const SizedBox.expand(),
-            );
-          },
+        child: CustomPaint(
+          painter: _AmbientBackgroundPainter(progress: 0.5),
+          child: SizedBox.expand(),
         ),
       ),
     );
@@ -5155,7 +5137,7 @@ class _AmbientBackgroundPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _AmbientBackgroundPainter oldDelegate) {
-    return oldDelegate.progress != progress;
+    return false;
   }
 }
 
@@ -5173,29 +5155,32 @@ class _TopBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 8, 18, 8),
-      child: Container(
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.12),
-          borderRadius: BorderRadius.circular(18),
-          border: Border.all(color: color.withValues(alpha: 0.22)),
-        ),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-        child: Row(
-          children: [
-            Icon(icon, color: color, size: 18),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                label,
-                style: GoogleFonts.plusJakartaSans(
-                  color: color,
-                  fontWeight: FontWeight.w700,
+    return Semantics(
+      liveRegion: true,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 8, 18, 8),
+        child: Container(
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: color.withValues(alpha: 0.22)),
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Row(
+            children: [
+              Icon(icon, color: color, size: 18),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  label,
+                  style: GoogleFonts.plusJakartaSans(
+                    color: color,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
