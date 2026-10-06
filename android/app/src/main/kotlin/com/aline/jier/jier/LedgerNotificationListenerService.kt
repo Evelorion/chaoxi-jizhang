@@ -6,6 +6,31 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 
 class LedgerNotificationListenerService : NotificationListenerService() {
+    private companion object {
+        /**
+         * 需要关注的应用。只有这些应用的通知才会进入原文收件箱，
+         * 微信聊天之类的无关内容不会被保存下来。
+         */
+        val WATCHED_PACKAGES = setOf(
+            "com.tencent.mm",
+            "com.eg.android.AlipayGphone",
+            "com.google.android.apps.walletnfcrel",
+            "com.google.android.apps.nbu.paisa.user",
+            "com.taobao.taobao",
+            "com.jingdong.app.mall",
+            "com.xunmeng.pinduoduo",
+            "com.taobao.idlefish",
+            // 六大国有银行
+            "com.icbc",
+            "com.icbc.im",
+            "com.chinamworld.main",
+            "com.android.bankabc",
+            "com.chinamworld.bocmbci",
+            "com.bankcomm.Bankcomm",
+            "com.yitong.mbank.psbc",
+        )
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn ?: return
         val notification = sbn.notification ?: return
@@ -77,6 +102,21 @@ class LedgerNotificationListenerService : NotificationListenerService() {
             )
         }
 
+        // 第一步：先原样存下这条通知，后面的解析和 AI 都基于它。
+        // 解析失败、应用被系统杀掉，原文都还在。
+        val rawId = if (sbn.packageName in WATCHED_PACKAGES && potentialPayment) {
+            RawNotificationStore.append(
+                context = applicationContext,
+                packageName = sbn.packageName,
+                title = title,
+                body = body,
+                profileId = profileId,
+                postedAtMillis = sbn.postTime,
+            )
+        } else {
+            ""
+        }
+
         val capture = NotificationParser.parse(
             packageName = sbn.packageName,
             profileId = profileId,
@@ -91,6 +131,12 @@ class LedgerNotificationListenerService : NotificationListenerService() {
 
         if (capture == null) {
             if (potentialPayment) {
+                RawNotificationStore.markStatus(
+                    applicationContext,
+                    rawId,
+                    "unparsed",
+                    "看着像支付，但没能识别出金额或方向",
+                )
                 Log.d(
                     "JierAutoCapture",
                     "skipped package=${sbn.packageName} profile=$profileId"
@@ -99,6 +145,12 @@ class LedgerNotificationListenerService : NotificationListenerService() {
             return
         }
 
+        RawNotificationStore.markStatus(
+            applicationContext,
+            rawId,
+            "parsed",
+            capture.scenario,
+        )
         handleNotificationEvent(capture)
     }
 
@@ -148,25 +200,7 @@ class LedgerNotificationListenerService : NotificationListenerService() {
         summaryText: String,
         body: String,
     ): Boolean {
-        if (packageName !in setOf(
-                "com.tencent.mm",
-                "com.eg.android.AlipayGphone",
-                "com.google.android.apps.walletnfcrel",
-                "com.google.android.apps.nbu.paisa.user",
-                "com.taobao.taobao",
-                "com.jingdong.app.mall",
-                "com.xunmeng.pinduoduo",
-                "com.taobao.idlefish",
-                // 六大国有银行
-                "com.icbc",
-                "com.icbc.im",
-                "com.chinamworld.main",
-                "com.android.bankabc",
-                "com.chinamworld.bocmbci",
-                "com.bankcomm.Bankcomm",
-                "com.yitong.mbank.psbc",
-            )
-        ) {
+        if (packageName !in WATCHED_PACKAGES) {
             return false
         }
 

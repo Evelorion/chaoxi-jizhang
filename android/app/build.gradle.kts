@@ -43,6 +43,18 @@ android {
             storeFile = keystoreProperties["storeFile"]?.let { file(it as String) }
             storePassword = keystoreProperties["storePassword"] as String?
         }
+        // 有些机器的 ~/.android/debug.keystore 口令已经损坏，会让 debug / profile
+        // 构建全部失败。项目内 android/debug.keystore 存在时直接改用它，
+        // 这样 debug、profile 以及没配正式签名时的 release 都能构建。
+        val projectDebugKeystore = file("../debug.keystore")
+        if (projectDebugKeystore.exists()) {
+            getByName("debug") {
+                storeFile = projectDebugKeystore
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
     }
 
     buildTypes {
