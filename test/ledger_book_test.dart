@@ -1281,4 +1281,68 @@ void main() {
       greaterThan(captureFieldThresholds['category']!),
     );
   });
+  test('common questions are understood locally, without asking the model', () {
+    LedgerEntry entry(String id, String title, String merchant, double amount,
+            String categoryId, DateTime at) =>
+        LedgerEntry(
+          id: id,
+          title: title,
+          merchant: merchant,
+          note: '',
+          amount: amount,
+          type: EntryType.expense,
+          categoryId: categoryId,
+          channel: PaymentChannel.wechatPay,
+          occurredAt: at,
+          autoCaptured: true,
+          sourceLabel: '微信',
+        );
+    final now = DateTime(2026, 10, 6, 20);
+    final book = LedgerBook.empty(false).copyWith(
+      entries: [
+        entry('a', '麦当劳 午餐', '麦当劳', 30, 'food', DateTime(2026, 10, 6, 12)),
+        entry('b', '淘宝 · 手机壳', '数码配件店', 39, 'shopping', DateTime(2026, 10, 4)),
+        entry('c', '微信付款 · 某某', '某某', 78, 'daily', DateTime(2026, 10, 2, 19)),
+        entry('d', '瑞幸咖啡', '瑞幸', 22, 'food', DateTime(2026, 9, 20)),
+      ],
+    );
+
+    // 「我最近有什么消费」→ 最近 30 天，列出流水
+    final s1 = parseLedgerQuerySpecByRules('我最近有什么消费', now: now, book: book);
+    expect(s1, isNotNull);
+    expect(s1!.intent, 'find');
+    expect(s1.startDate, DateTime(2026, 9, 7));
+    expect(runLedgerQuery(book, s1, now: now).entryIds, isNotEmpty);
+
+    // 「我有个78的消费记录吗」→ 按金额精确找
+    final s2 = parseLedgerQuerySpecByRules('我有个78的消费记录吗', now: now, book: book);
+    expect(s2, isNotNull);
+    expect(s2!.intent, 'find');
+    expect(s2.amount, 78);
+    final found = runLedgerQuery(book, s2, now: now);
+    expect(found.entryIds, ['c']);
+    expect(found.text, contains('78.00'));
+
+    // 「什么时间」→ 追问，继承上一轮的金额条件，答出日期
+    final s3 = parseLedgerQuerySpecByRules('什么时间', now: now, book: book);
+    expect(s3, isNotNull);
+    expect(s3!.intent, 'latest');
+    final merged = s3.mergedWith(s2);
+    expect(merged.amount, 78);
+    expect(runLedgerQuery(book, merged, now: now).text, contains('2026-10-02'));
+
+    // 今天 / 分类 / 商户 也都认得
+    final today = parseLedgerQuerySpecByRules('今天花了多少', now: now, book: book)!;
+    expect(today.intent, 'sum');
+    expect(today.startDate, DateTime(2026, 10, 6));
+    final food = parseLedgerQuerySpecByRules('这个月餐饮花了多少', now: now, book: book)!;
+    expect(food.categoryId, 'food');
+    expect(food.intent, 'sum');
+    final merchant = parseLedgerQuerySpecByRules('麦当劳花了多少', now: now, book: book)!;
+    expect(merchant.merchant, '麦当劳');
+
+    // 完全无关的话不求强解 —— 交给模型，模型不行就如实说没听懂
+    expect(parseLedgerQuerySpecByRules('今天天气怎么样', now: now, book: book), isNull);
+    expect(parseLedgerQuerySpecByRules('帮我看看这个', now: now, book: book), isNull);
+  });
 }

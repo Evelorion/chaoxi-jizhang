@@ -477,17 +477,14 @@ class _LocalAiChatPageState extends ConsumerState<LocalAiChatPage> {
       setState(() => _error = LocalAiCapability.unavailableMessage);
       return;
     }
-    if (!_modelReady) {
-      setState(() => _error = '还没有下载离线千问模型，先在“设置 → 离线千问”里下载一个。');
+    // 常见问法先由本地规则看懂：这类问题不需要模型也能答（模型没装/跑不动时照样给数字）。
+    final ruleSpec = parseLedgerQuerySpecByRules(question, book: book);
+    if (!_modelReady && ruleSpec == null) {
+      setState(() => _error = '这个问题需要离线千问。可以先去“设置 → 离线千问”下载模型，'
+          '或者直接问“今天花了多少”“上个月餐饮多少钱”这类本地能答的问题。');
       return;
     }
     final model = _selectedLocalAiModel(book.settings);
-    final query = buildLedgerAiQuery(
-      book,
-      question,
-      previousEntryIds: _focusEntryIds,
-      history: _messages,
-    );
     _input.clear();
     FocusScope.of(context).unfocus();
     setState(() {
@@ -505,8 +502,17 @@ class _LocalAiChatPageState extends ConsumerState<LocalAiChatPage> {
       _status = '正在翻账本…';
     });
     _scrollToEnd();
-    if (query.entryIds.isEmpty) {
-      _finishAnswer('没有找到符合条件的账单。换个说法再试试，比如带上商家名或日期。', query.entryIds);
+    // 本地能看懂的问题：模型没装也直接算给你看（不再要求模型可用）。
+    if (ruleSpec != null && !_modelReady) {
+      final spec = ruleSpec.mergedWith(_ledger?.lastQuerySpec);
+      final outcome = runLedgerQuery(
+        book,
+        spec,
+        now: DateTime.now(),
+        statsIndex: _ledger?.statsIndexFor(book),
+      );
+      if (!outcome.empty) _ledger?.rememberQuerySpec(spec);
+      _finishAnswer(outcome.text, outcome.entryIds);
       return;
     }
     // 打开页面时已经在后台预热模型，这里等它读完，避免白等两次。
@@ -527,7 +533,7 @@ class _LocalAiChatPageState extends ConsumerState<LocalAiChatPage> {
     _tickTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted || _draftAnswer.isNotEmpty) return;
       final seconds = DateTime.now().difference(startedAt).inSeconds;
-      setState(() => _status = '正在读账本并组织回答…$seconds 秒');
+      setState(() => _status = '正在处理…$seconds 秒');
     });
     try {
       if (mounted) setState(() => _status = '正在准备模型…');
@@ -542,8 +548,18 @@ class _LocalAiChatPageState extends ConsumerState<LocalAiChatPage> {
       await llama.clearContext();
       if (mounted) setState(() => _status = '正在理解你的问题…');
 
-      // 第一次生成：只把这句话翻译成查询条件（输入只有二三百字，不塞流水）。
       final previousSpec = _ledger?.lastQuerySpec;
+      // ① 常见问法本地直接看懂（今天花了多少 / 有个78的记录吗 / 上个月餐饮多少 / 什么时间…），
+      //    这一步不问模型，又快又不会胡说。
+      final ruleSpec = parseLedgerQuerySpecByRules(question, book: book);
+      if (ruleSpec != null) {
+        final spec = ruleSpec.mergedWith(previousSpec);
+        await _answerWithSpec(llama, book, spec, question);
+        return;
+      }
+
+      // ② 规则看不懂 → 让模型把这句话翻译成查询条件（输入只有二三百字，不塞流水）。
+      if (mounted) setState(() => _status = '正在理解你的问题…');
       final specRaw = await _generateRound(
         llama,
         [
@@ -561,99 +577,48 @@ class _LocalAiChatPageState extends ConsumerState<LocalAiChatPage> {
       final parsedSpec = parseLedgerQuerySpec(specRaw);
       if (parsedSpec != null) {
         final spec = parsedSpec.mergedWith(previousSpec);
-        if (spec.intent == 'fuzzy') {
-          // 没有明确商户/分类的问题：先本地全文检索 + 向量重排，再让模型挑一条说出来。
-          final hits = searchLedgerFuzzy(book, question, now: DateTime.now());
-          _ledger?.rememberQuerySpec(spec);
-          if (hits.isEmpty) {
-            _finishAnswer('没有找到相关的流水，换个说法再试试。', const []);
-            return;
-          }
-          if (mounted) setState(() => _status = '找到几条可能的，正在核对…');
-          await llama.clearContext();
-          final fuzzyRaw = await _generateRound(
-            llama,
-            [
-              ChatMessage(
-                role: 'system',
-                content: '你是账本助手。下面是本地检索出来的候选流水，'
-                    '挑出用户问的那一笔，用一句中文说清楚（日期 + 金额 + 商户/备注）。'
-                    '只能依据给出的数据，不要编造。',
-              ),
-              ChatMessage(
-                role: 'user',
-                content: '问：${_shortLocalAiText(question, 40)}\\n'
-                    '候选：\\n${describeSearchHits(hits)}\\n请用一句中文回答。',
-              ),
-            ],
-            maxTokens: 120,
-          );
-          final fuzzyAnswer = _visibleLocalAiAnswer(fuzzyRaw);
-          _finishAnswer(
-            fuzzyAnswer.isEmpty ? describeSearchHits(hits) : fuzzyAnswer,
-            hits.map((hit) => hit.entry.id).toList(),
-          );
-          return;
-        }
+        await _answerWithSpec(llama, book, spec, question);
+        return;
+      }
 
-        final outcome = runLedgerQuery(
-          book,
-          spec,
-          now: DateTime.now(),
-          // 账本没变就直接复用统计缓存，变了自动重建（#13/#14）。
-          statsIndex: _ledger?.statsIndexFor(book),
-        );
-        _ledger?.rememberQuerySpec(outcome.empty ? previousSpec : spec);
-        if (outcome.empty) {
-          // 查不到就直接如实回答，不用再让模型生成一遍。
-          _finishAnswer(outcome.text, outcome.entryIds);
-          return;
-        }
-        if (mounted) setState(() => _status = '数据查到了，正在组织回答…');
+      // ③ 模型也没给出合法条件 → 本地模糊检索兜底；再找不到就如实说没听懂。
+      //    **绝不把整段流水塞给模型让它自由发挥** —— 那是「答非所问」的根源。
+      final rescue = searchLedgerFuzzy(book, question, now: DateTime.now());
+      if (rescue.isNotEmpty) {
+        if (mounted) setState(() => _status = '找到几条可能的，正在核对…');
         await llama.clearContext();
-        final answerRaw = await _generateRound(
+        final rescueRaw = await _generateRound(
           llama,
           [
             ChatMessage(
               role: 'system',
-              content: '你是账本助手。只根据给出的那一行数据，用一句中文回答；'
-                  '不要编造，也不要自己再算别的数字。',
+              content: '你是账本助手。下面几行是本地检索出的候选流水，'
+                  '挑最像用户问的那一笔，用一句中文说清楚；只能依据给出的数据。',
             ),
             ChatMessage(
               role: 'user',
               content: '问：${_shortLocalAiText(question, 40)}\n'
-                  '数据：${outcome.text}\n请用一句中文回答。',
+                  '候选：\n${describeSearchHits(rescue)}\n请用一句中文回答。',
             ),
           ],
           maxTokens: 120,
         );
-        final answer = _visibleLocalAiAnswer(answerRaw);
+        final rescueAnswer = _visibleLocalAiAnswer(rescueRaw);
         _finishAnswer(
-          answer.isEmpty ? outcome.text : answer,
-          outcome.entryIds.isEmpty ? query.entryIds : outcome.entryIds,
+          rescueAnswer.isEmpty ? describeSearchHits(rescue) : rescueAnswer,
+          rescue.map((hit) => hit.entry.id).toList(),
         );
         return;
       }
-
-      // 兜底：模型没给出合法的查询条件时，才退回『本地筛好再问』的老路。
-      if (mounted) setState(() => _status = '正在读账本并组织回答…');
-      await llama.clearContext();
-      final fallbackRaw = await _generateRound(
-        llama,
-        [
-          ChatMessage(
-            role: 'system',
-            content: '你是本地账本助手。只能依据给出的账本数据回答，不要编造交易。',
-          ),
-          ChatMessage(role: 'user', content: query.prompt),
-        ],
-        maxTokens: 180,
-      );
-      final answer = _visibleLocalAiAnswer(fallbackRaw);
       _finishAnswer(
-        answer.isEmpty ? '这次没有生成能看懂的回答，再说一次试试。' : answer,
-        query.entryIds,
+        '这句我没听懂。可以试试这样问：\n'
+        '· 今天花了多少\n'
+        '· 上个月餐饮多少钱\n'
+        '· 找一下 78 元的记录\n'
+        '· 最近一笔是什么',
+        const [],
       );
+      return;
     } catch (e) {
       final friendly = _friendlyLocalAiError(e);
       _finishAnswer(
@@ -703,7 +668,87 @@ class _LocalAiChatPageState extends ConsumerState<LocalAiChatPage> {
     return _draftRaw;
   }
 
-/// 第一轮只需要"上一轮条件 + 这句话"，尽量短。
+  /// 结构化查询的执行与作答：数字全部本地算，模型只说一句话。
+  Future<void> _answerWithSpec(
+    LlamaController llama,
+    LedgerBook book,
+    LedgerQuerySpec spec,
+    String question,
+  ) async {
+    if (spec.intent == 'fuzzy') {
+      final hits = searchLedgerFuzzy(book, question, now: DateTime.now());
+      _ledger?.rememberQuerySpec(spec);
+      if (hits.isEmpty) {
+        _finishAnswer('没有找到相关的流水，换个说法再试试。', const []);
+        return;
+      }
+      if (mounted) setState(() => _status = '找到几条可能的，正在核对…');
+      await llama.clearContext();
+      final fuzzyRaw = await _generateRound(
+        llama,
+        [
+          ChatMessage(
+            role: 'system',
+            content: '你是账本助手。下面是本地检索出来的候选流水，'
+                '挑出用户问的那一笔，用一句中文说清楚（日期 + 金额 + 商户/备注）。'
+                '只能依据给出的数据，不要编造。',
+          ),
+          ChatMessage(
+            role: 'user',
+            content: '问：${_shortLocalAiText(question, 40)}\n'
+                '候选：\n${describeSearchHits(hits)}\n请用一句中文回答。',
+          ),
+        ],
+        maxTokens: 120,
+      );
+      final fuzzyAnswer = _visibleLocalAiAnswer(fuzzyRaw);
+      _finishAnswer(
+        fuzzyAnswer.isEmpty ? describeSearchHits(hits) : fuzzyAnswer,
+        hits.map((hit) => hit.entry.id).toList(),
+      );
+      return;
+    }
+
+    final outcome = runLedgerQuery(
+      book,
+      spec,
+      now: DateTime.now(),
+      // 账本没变就直接复用统计缓存，变了自动重建（#13/#14）。
+      statsIndex: _ledger?.statsIndexFor(book),
+    );
+    // 查不到就不污染上下文，也不再浪费一次模型生成。
+    if (!outcome.empty) _ledger?.rememberQuerySpec(spec);
+    if (outcome.empty) {
+      _finishAnswer(outcome.text, const []);
+      return;
+    }
+    if (mounted) setState(() => _status = '数据查到了，正在组织回答…');
+    await llama.clearContext();
+    final answerRaw = await _generateRound(
+      llama,
+      [
+        ChatMessage(
+          role: 'system',
+          content: '你是账本助手。只根据给出的那一行数据，用一句中文回答；'
+              '不要编造，也不要自己再算别的数字。',
+        ),
+        ChatMessage(
+          role: 'user',
+          content: '问：${_shortLocalAiText(question, 40)}\n'
+              '数据：${outcome.text}\n请用一句中文回答。',
+        ),
+      ],
+      maxTokens: 120,
+    );
+    final answer = _visibleLocalAiAnswer(answerRaw);
+    // 模型没说出话时，直接把算好的结果给用户 —— 绝不空着。
+    _finishAnswer(
+      answer.isEmpty ? outcome.text : answer,
+      outcome.entryIds.isEmpty ? _focusEntryIds : outcome.entryIds,
+    );
+  }
+
+  /// 第一轮只需要"上一轮条件 + 这句话"，尽量短。
   String _queryRoundQuestion(String question, LedgerQuerySpec? previous) {
     final buffer = StringBuffer();
     if (previous != null) {
