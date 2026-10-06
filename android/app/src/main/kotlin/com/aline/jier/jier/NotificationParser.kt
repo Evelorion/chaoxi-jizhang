@@ -278,6 +278,10 @@ object NotificationParser {
         Regex("""(?:^|[\s，,。])(?:已向|已转给|已轉給|已付款给|已付款給)(?!你|您)([^¥￥$0-9，,。:：;；\s]{1,32}?)(?:發起|发起|轉帳|转账|付款|支付|收款碼|收款码|$|[¥￥$])"""),
         Regex("""(?:^|[\s，,。])向(?!你|您)([^¥￥$0-9，,。:：;；\s]{1,32}?)(?:轉帳|转账|付款|支付|收款碼|收款码)"""),
         Regex("""(?:转账给|轉帳給|轉給|转给|付款给|付款給)([^¥￥$0-9，,。:：;；\s]{1,32}?)(?:的?(?:轉帳|转账|付款|支付|收款碼|收款码|$|[¥￥$]))"""),
+        // 微信转账常见写法：金额在"转账"和"给"中间 —— "你已成功转账￥200.00给妈妈"
+        Regex("""(?:转账|轉帳|转给|轉給|付款)[^¥￥$0-9，,。:：;；\s]{0,8}(?:¥|￥|\$)?[0-9][0-9.,]*\s*(?:元|圓|块|塊)?\s*给([^¥￥$0-9，,。:：;；\s]{1,32})"""),
+        // "已转账给张三 200 元"这类顺序颠倒的写法
+        Regex("""(?:转账|轉帳)[^¥￥$0-9，,。:：;；\s]{0,4}给\s*([^¥￥$0-9，,。:：;；\s]{1,32})"""),
         Regex("""([^¥￥$0-9，,。:：;；\s]{1,32}?)(?:向你转账|向你轉帳|向您转账|向您轉帳|已向你付款|已向您付款|向你付款|向您付款)"""),
         Regex("""([^¥￥$0-9，,。:：;；\s]{1,32}?)(?:已收下你的转账|已收下你的轉帳|已接收你的转账|已接收你的轉帳|已领取你的转账|已領取你的轉帳)"""),
         Regex("""(?:来自|來自|from)\s*([^¥￥$0-9，,。:：;；\s]{1,32}?)(?:的?(?:轉帳|转账|付款|支付|收款|$))""", RegexOption.IGNORE_CASE),
@@ -363,8 +367,15 @@ object NotificationParser {
             return null
         }
 
-        val entryType = inferEntryType(source, merged, amount, eventKind)
-        val scenario = inferScenario(source, merged, entryType, amount, eventKind)
+        val rawEntryType = inferEntryType(source, merged, amount, eventKind)
+        val scenario = inferScenario(source, merged, rawEntryType, amount, eventKind)
+        // 转账是"钱从一个账户/人转到另一个"，既不是消费也不是收入：
+        // 场景判定（转出/转入）之后再收敛类型，避免转账被算进支出统计。
+        val entryType = if (scenario == "transferPayment" || scenario == "transferReceipt") {
+            "transfer"
+        } else {
+            rawEntryType
+        }
         val counterpartyName = extractCounterpartyName(
             source = source,
             scenario = scenario,
@@ -393,7 +404,11 @@ object NotificationParser {
             normalizedConversationTitle,
             normalizedBody,
         )
-        val defaultCategoryId = inferCategory(source, merged, merchant)
+        val defaultCategoryId = if (entryType == "transfer") {
+            "transfer"
+        } else {
+            inferCategory(source, merged, merchant)
+        }
         val detailSummary = buildDetailSummary(
             source = source,
             scenario = scenario,
@@ -512,7 +527,27 @@ object NotificationParser {
                 return "expense"
             }
         }
-        if (containsAny(lowercase, listOf("向你转账", "向你轉帳", "向您转账", "向您轉帳", "已向你付款", "已向您付款"))) {
+        // 收到别人的钱：措辞千变万化，先把"进账"这一侧认全，再谈转出
+        if (containsAny(
+                lowercase,
+                listOf(
+                    "收到一笔转账",
+                    "收到转账",
+                    "收到好友转账",
+                    "收到你的转账",
+                    "转账到账",
+                    "已到账",
+                    "向你转账",
+                    "向你轉帳",
+                    "向您转账",
+                    "向您轉帳",
+                    "来自",
+                    "來自",
+                    "已向你付款",
+                    "已向您付款",
+                ),
+            )
+        ) {
             return "income"
         }
         if (containsAny(lowercase, listOf("转账给", "轉帳給", "付款给", "付款給", "你向", "您向", "已向", "已转给", "已轉給"))) {
@@ -837,7 +872,13 @@ object NotificationParser {
             )
             if (counterpartyName.isNotBlank()) {
                 append('\n')
-                append(if (entryType == "income") "付款人：" else "收款方：")
+                append(
+                    if (entryType == "income" || scenario == "transferReceipt") {
+                        "付款人："
+                    } else {
+                        "收款方："
+                    },
+                )
                 append(counterpartyName)
             }
             if (merchant.isNotBlank() && merchant != UNKNOWN_COUNTERPARTY && merchant != counterpartyName) {

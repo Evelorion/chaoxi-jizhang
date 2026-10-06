@@ -1357,11 +1357,18 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         templateHits[capture.id] = template!.categoryId;
       }
     }
+    // 转账不需要模型判断：钱从谁到谁是通知里的事实，分类固定为「转账」。
+    // 转账也不算消费/收入，所以直接走确定性路径，既快又不会算错账。
+    final transferHits = <String, String>{
+      for (final capture in allowedCaptures)
+        if (capture.entryType == EntryType.transfer) capture.id: 'transfer',
+    };
     final needAi = allowedCaptures
         .where(
           (capture) =>
               !cachedCategories.containsKey(capture.id) &&
-              !templateHits.containsKey(capture.id),
+              !templateHits.containsKey(capture.id) &&
+              !transferHits.containsKey(capture.id),
         )
         .toList();
     final aiBatch = needAi.isEmpty
@@ -1386,6 +1393,14 @@ class LedgerController extends StateNotifier<LedgerViewState> {
           tags: const [],
         ),
       for (final entry in templateHits.entries)
+        entry.key: AiCaptureFields(
+          categoryId: entry.value,
+          title: '',
+          merchant: '',
+          counterparty: '',
+          tags: const [],
+        ),
+      for (final entry in transferHits.entries)
         entry.key: AiCaptureFields(
           categoryId: entry.value,
           title: '',
@@ -1595,10 +1610,13 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     AiCaptureFields? aiFields,
     bool needsReview = false,
   }) async {
-    final categoryId = aiFields?.categoryId ??
-        (capture.entryType == EntryType.expense
-            ? resolveDefaultExpenseCategoryId(book.settings)
-            : _fallbackCategoryIdForType(EntryType.income));
+    // 转账的分类是确定的（不是推测），也不参与消费/收入统计。
+    final categoryId = capture.entryType == EntryType.transfer
+        ? 'transfer'
+        : (aiFields?.categoryId ??
+              (capture.entryType == EntryType.expense
+                  ? resolveDefaultExpenseCategoryId(book.settings)
+                  : _fallbackCategoryIdForType(EntryType.income)));
     final displaySource = capture.source.isShoppingSource
         ? capture.source
         : capture.relatedSources.firstWhereOrNull(
@@ -1689,7 +1707,8 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         ...sourceTags,
         scenarioLabel,
         ...?aiFields?.tags,
-        if (aiFields != null) '千问整理',
+        // 转账的分类是程序判定的，不能标成「千问整理」。
+        if (aiFields != null && capture.entryType != EntryType.transfer) '千问整理',
         // 千问自己也没把握：标出来让你扫一眼，改一次它就记住了。
         if (needsReview ||
             (aiFields != null && aiFields.categoryConfidence < 0.7))
@@ -2630,7 +2649,7 @@ class LedgerViewState {
 enum EntryType {
   expense('支出'),
   income('收入'),
-  transfer('转移');
+  transfer('转账');
 
   const EntryType(this.label);
 
@@ -2890,6 +2909,17 @@ const appCategories = <AppCategory>[
     icon: Icons.trending_up_rounded,
     color: Color(0xFF16A085),
     keywords: ['dividend', '理财', '利息', 'investment'],
+  ),
+  // 转账是"钱从一个地方到另一个地方"，既不是消费也不是收入，
+  // 单独成一类，统计时才不会把给家人转的钱算成开销。
+  AppCategory(
+    id: 'transfer',
+    name: '转账',
+    pillar: '流转',
+    type: EntryType.transfer,
+    icon: Icons.swap_horiz_rounded,
+    color: Color(0xFF7B61FF),
+    keywords: ['转账', '轉帳', '转帳', '轉賬', '转賬', '红包', '紅包', 'transfer'],
   ),
 ];
 

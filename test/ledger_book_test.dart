@@ -1345,4 +1345,62 @@ void main() {
     expect(parseLedgerQuerySpecByRules('今天天气怎么样', now: now, book: book), isNull);
     expect(parseLedgerQuerySpecByRules('帮我看看这个', now: now, book: book), isNull);
   });
+  test('transfers are their own type: not spending, not income', () {
+    LedgerEntry entry(String id, double amount, EntryType type, DateTime at,
+            {String categoryId = 'daily'}) =>
+        LedgerEntry(
+          id: id,
+          title: id,
+          merchant: '妈妈',
+          note: '',
+          amount: amount,
+          type: type,
+          categoryId: categoryId,
+          channel: PaymentChannel.wechatPay,
+          occurredAt: at,
+          autoCaptured: true,
+          sourceLabel: '微信',
+        );
+    final now = DateTime(2026, 10, 6, 20);
+    final book = LedgerBook.empty(false).copyWith(
+      entries: [
+        entry('午餐', 100, EntryType.expense, DateTime(2026, 10, 6, 12)),
+        entry('转账给妈妈', 200, EntryType.transfer, DateTime(2026, 10, 6, 13),
+            categoryId: 'transfer'),
+        entry('收到转账', 50, EntryType.transfer, DateTime(2026, 10, 6, 14),
+            categoryId: 'transfer'),
+      ],
+    );
+
+    // 「转账」是一个正式分类，属于 transfer 类型
+    expect(
+      categoriesForType(EntryType.transfer).map((c) => c.id),
+      contains('transfer'),
+    );
+    expect(EntryType.transfer.label, '转账');
+
+    // 求和：只算真正的消费，转账不进支出
+    final sum = runLedgerQuery(
+      book,
+      LedgerQuerySpec(
+        intent: 'sum',
+        startDate: DateTime(2026, 10, 1),
+        endDate: DateTime(2026, 10, 31),
+      ),
+      now: now,
+    );
+    expect(sum.text, contains('100.00'));
+    expect(sum.text, isNot(contains('300.00')));
+    expect(sum.text, contains('收入0.00元'));
+
+    // 统计缓存：金额不算转账，但笔数照算
+    final index = buildLedgerStatsIndex(book);
+    final day = index.range(DateTime(2026, 10, 6), DateTime(2026, 10, 6));
+    expect(day.expense, 100);
+    expect(day.income, 0);
+    expect(day.count, 3);
+
+    // 异常提醒也不会把转账当成消费异常
+    expect(detectLedgerAnomalies(book, now: now), isEmpty);
+  });
 }

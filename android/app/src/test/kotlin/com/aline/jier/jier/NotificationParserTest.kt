@@ -19,7 +19,8 @@ class NotificationParserTest {
 
         assertNotNull(event)
         assertEquals("wechat", event?.source)
-        assertEquals("expense", event?.entryType)
+        // 转账不算支出：类型是 transfer，场景保留方向
+        assertEquals("transfer", event?.entryType)
         assertEquals("transferPayment", event?.scenario)
         assertEquals("夏曦晨光", event?.counterpartyName)
         assertEquals("未识别对象", event?.merchant)
@@ -38,7 +39,7 @@ class NotificationParserTest {
         )
 
         assertNotNull(event)
-        assertEquals("expense", event?.entryType)
+        assertEquals("transfer", event?.entryType)
         assertEquals("transferPayment", event?.scenario)
         assertEquals("李四", event?.counterpartyName)
         assertEquals(66.00, event?.amount ?: 0.0, 0.001)
@@ -55,7 +56,7 @@ class NotificationParserTest {
         )
 
         assertNotNull(event)
-        assertEquals("income", event?.entryType)
+        assertEquals("transfer", event?.entryType)
         assertEquals("transferReceipt", event?.scenario)
         assertEquals("夏曦晨光", event?.counterpartyName)
         assertTrue(event?.detailSummary?.contains("付款人：夏曦晨光") == true)
