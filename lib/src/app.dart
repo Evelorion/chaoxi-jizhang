@@ -2,11 +2,14 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi' as ffi;
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:collection/collection.dart';
+import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
@@ -18,11 +21,11 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart' as ph;
 import 'package:uuid/uuid.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:llama_flutter_android/llama_flutter_android.dart';
 
 part 'ui_extensions.dart';
 part 'ui_predict_cards.dart';
@@ -30,6 +33,7 @@ part 'nlp_engine.dart';
 part 'ui_voice_fab.dart';
 part 'location_helper.dart';
 part 'ui_location_map.dart';
+part 'local_ai.dart';
 
 const _uuid = Uuid();
 const _ledgerFileName = 'chaoxi_vault.enc';
@@ -262,8 +266,13 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
           children: [
             const _AmbientBackground(),
             SafeArea(child: _buildStateBody(context, state)),
-            if (_selectedIndex == 0 && state.book != null && state.book!.settings.voiceInputEnabled)
-              VoiceRecordingFab(book: state.book!, controller: ref.read(ledgerControllerProvider.notifier)),
+            if (_selectedIndex == 0 &&
+                state.book != null &&
+                state.book!.settings.voiceInputEnabled)
+              VoiceRecordingFab(
+                book: state.book!,
+                controller: ref.read(ledgerControllerProvider.notifier),
+              ),
           ],
         ),
       ),
@@ -361,7 +370,6 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
             ],
           ),
         ),
-
       ],
     );
   }
@@ -382,6 +390,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
   final AndroidWindowPrivacyBridge _windowPrivacyBridge;
   final BiometricVaultBridge _biometricVaultBridge;
   String? _sessionPassphrase;
+  bool _syncingAutoCapture = false;
 
   Future<void> initialize() async {
     state = state.copyWith(initializing: true, errorMessage: null);
@@ -835,7 +844,11 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       favoriteLocations: [...book.favoriteLocations, location],
       updatedAt: DateTime.now(),
     );
-    await _persistBook(updated, passphrase, notice: '已添加常用地点「${location.name}」。');
+    await _persistBook(
+      updated,
+      passphrase,
+      notice: '已添加常用地点「${location.name}」。',
+    );
   }
 
   Future<void> removeFavoriteLocation(String id) async {
@@ -843,10 +856,15 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     final passphrase = _sessionPassphrase;
     if (book == null || passphrase == null) return;
 
-    final locations = book.favoriteLocations.where((item) => item.id != id).toList();
+    final locations = book.favoriteLocations
+        .where((item) => item.id != id)
+        .toList();
     if (locations.length == book.favoriteLocations.length) return;
 
-    final updated = book.copyWith(favoriteLocations: locations, updatedAt: DateTime.now());
+    final updated = book.copyWith(
+      favoriteLocations: locations,
+      updatedAt: DateTime.now(),
+    );
     await _persistBook(updated, passphrase, notice: '常用地点已删除。');
   }
 
@@ -858,11 +876,24 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     final locations = book.favoriteLocations.map((item) {
       return item.id == location.id ? location : item;
     }).toList();
-    final updated = book.copyWith(favoriteLocations: locations, updatedAt: DateTime.now());
+    final updated = book.copyWith(
+      favoriteLocations: locations,
+      updatedAt: DateTime.now(),
+    );
     await _persistBook(updated, passphrase, notice: '常用地点已更新。');
   }
 
   Future<void> syncAutoCapturedEntries({bool silent = false}) async {
+    if (_syncingAutoCapture) return;
+    _syncingAutoCapture = true;
+    try {
+      await _syncAutoCapturedEntries(silent: silent);
+    } finally {
+      _syncingAutoCapture = false;
+    }
+  }
+
+  Future<void> _syncAutoCapturedEntries({required bool silent}) async {
     final book = state.book;
     final passphrase = _sessionPassphrase;
     if (book == null ||
@@ -900,12 +931,22 @@ class LedgerController extends StateNotifier<LedgerViewState> {
           ..sort((a, b) => a.postedAtMillis.compareTo(b.postedAtMillis));
 
     if (allowedCaptures.isEmpty) {
+      await _autoCaptureBridge.acknowledgeRecords(captures);
       state = state.copyWith(
         lastAutoSyncAt: DateTime.now(),
         noticeMessage: silent ? state.noticeMessage : '发现新通知，但已被当前自动导入策略忽略。',
       );
       return;
     }
+
+    final aiModel = LocalAiModel.available.firstWhere(
+      (model) => model.id == book.settings.localAiModelId,
+      orElse: () => LocalAiModel.available.first,
+    );
+    final aiCategories = book.settings.autoAiCaptureEnabled
+        ? await classifyAutoCapturesLocally(allowedCaptures, aiModel)
+        : const <String, String>{};
+    if (aiCategories == null) return;
 
     final workingEntries = [...book.entries];
     var createdCount = 0;
@@ -920,6 +961,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
           workingEntries[sameIdIndex],
           capture,
           book,
+          aiCategoryId: aiCategories[capture.id],
         );
         updatedCount++;
         continue;
@@ -931,12 +973,17 @@ class LedgerController extends StateNotifier<LedgerViewState> {
           workingEntries[mergeIndex],
           capture,
           book,
+          aiCategoryId: aiCategories[capture.id],
         );
         updatedCount++;
         continue;
       }
 
-      final candidate = await _captureToEntry(capture, book);
+      final candidate = await _captureToEntry(
+        capture,
+        book,
+        aiCategoryId: aiCategories[capture.id],
+      );
       if (_containsSimilarAutoEntry(workingEntries, candidate)) {
         continue;
       }
@@ -945,6 +992,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     }
 
     if (createdCount == 0 && updatedCount == 0) {
+      await _autoCaptureBridge.acknowledgeRecords(captures);
       state = state.copyWith(
         lastAutoSyncAt: DateTime.now(),
         noticeMessage: silent ? state.noticeMessage : '自动记账通知已读取，无需新增或合并更新。',
@@ -962,15 +1010,25 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       if (createdCount > 0) '$createdCount 笔新增',
       if (updatedCount > 0) '$updatedCount 笔合并更新',
     ].join('，');
+    if (_sessionPassphrase != passphrase ||
+        state.locked ||
+        !identical(state.book, book)) {
+      return;
+    }
     await _persistBook(
       updatedBook,
       passphrase,
       notice: '自动记账已同步 $summary，覆盖微信 / 支付宝 / Google Pay / 淘宝 / 京东 / 拼多多 / 闲鱼。',
       lastAutoSyncAt: DateTime.now(),
     );
+    if (identical(state.book, updatedBook)) {
+      await _autoCaptureBridge.acknowledgeRecords(captures);
+    }
 
     // Backfill location for newly created entries (if enabled)
-    if (book.settings.autoRecordLocation && createdCount > 0) {
+    if (identical(state.book, updatedBook) &&
+        book.settings.autoRecordLocation &&
+        createdCount > 0) {
       for (final entry in workingEntries) {
         if (entry.locationInfo.isEmpty) {
           _backfillLocation(entry.id);
@@ -979,11 +1037,12 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     }
   }
 
-  Future<LedgerEntry> _captureToEntry(AutoCaptureRecord capture, LedgerBook book) async {
-    final inferred = inferAutoCaptureCategoryId(
-      book: book,
-      capture: capture,
-    );
+  Future<LedgerEntry> _captureToEntry(
+    AutoCaptureRecord capture,
+    LedgerBook book, {
+    String? aiCategoryId,
+  }) async {
+    final inferred = inferAutoCaptureCategoryId(book: book, capture: capture);
     final resolvedCategoryId = inferred.$1;
     final customTags = inferred.$2;
     final displaySource = capture.source.isShoppingSource
@@ -1035,7 +1094,10 @@ class LedgerController extends StateNotifier<LedgerViewState> {
           // Auto merchant identification via POI if merchant is empty
           if (capture.merchant.isEmpty) {
             try {
-              final poi = await LocationHelper.getNearbyPOI(locResult.latitude, locResult.longitude);
+              final poi = await LocationHelper.getNearbyPOI(
+                locResult.latitude,
+                locResult.longitude,
+              );
               if (poi.isNotEmpty) autoMerchant = poi;
             } catch (_) {}
           }
@@ -1061,13 +1123,14 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       ),
       amount: capture.amount,
       type: capture.entryType,
-      categoryId: resolvedCategoryId,
+      categoryId: aiCategoryId ?? resolvedCategoryId,
       channel: capture.channel,
       occurredAt: DateTime.fromMillisecondsSinceEpoch(capture.postedAtMillis),
       tags: [
         ...sourceTags,
         scenarioLabel,
         ...customTags,
+        if (aiCategoryId != null) '千问整理',
         if (capture.confidence >= 0.85) '高置信度',
       ],
       locationInfo: autoLocation,
@@ -1150,7 +1213,9 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         if (entry.autoProfileId != capture.profileId) return false;
         if (entry.type != capture.entryType) return false;
 
-        final existingSource = CaptureSource.fromLabelOrUnknown(entry.sourceLabel);
+        final existingSource = CaptureSource.fromLabelOrUnknown(
+          entry.sourceLabel,
+        );
         if (existingSource == CaptureSource.unknown) return false;
         if (existingSource == capture.source) return false;
 
@@ -1191,7 +1256,8 @@ class LedgerController extends StateNotifier<LedgerViewState> {
 
         // If amounts match exactly and it's a valid cross-source pair,
         // that's enough evidence to merge
-        if (capture.amount > 0 && entry.amount > 0 &&
+        if (capture.amount > 0 &&
+            entry.amount > 0 &&
             (entry.amount - capture.amount).abs() < 0.01) {
           return true;
         }
@@ -1207,9 +1273,14 @@ class LedgerController extends StateNotifier<LedgerViewState> {
   Future<LedgerEntry> _mergeEntryWithCapture(
     LedgerEntry existing,
     AutoCaptureRecord capture,
-    LedgerBook book,
-  ) async {
-    final candidate = await _captureToEntry(capture, book);
+    LedgerBook book, {
+    String? aiCategoryId,
+  }) async {
+    final candidate = await _captureToEntry(
+      capture,
+      book,
+      aiCategoryId: aiCategoryId,
+    );
     final existingSource = CaptureSource.fromLabelOrUnknown(
       existing.sourceLabel,
     );
@@ -1225,12 +1296,18 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     // Smart merchant picking: shopping sources (Taobao/JD/PDD) typically have
     // the real store name, while payment sources (WeChat/Alipay) often just say
     // "未识别商户". Always prefer the shopping source's richer merchant info.
-    final incomingIsRicher = capture.source.isShoppingSource && existingSource.isPaymentSource;
-    final existingIsRicher = existingSource.isShoppingSource && capture.source.isPaymentSource;
+    final incomingIsRicher =
+        capture.source.isShoppingSource && existingSource.isPaymentSource;
+    final existingIsRicher =
+        existingSource.isShoppingSource && capture.source.isPaymentSource;
     final String mergedMerchant;
-    if (incomingIsRicher && candidate.merchant.isNotEmpty && candidate.merchant != '未识别商户') {
+    if (incomingIsRicher &&
+        candidate.merchant.isNotEmpty &&
+        candidate.merchant != '未识别商户') {
       mergedMerchant = candidate.merchant;
-    } else if (existingIsRicher && existing.merchant.isNotEmpty && existing.merchant != '未识别商户') {
+    } else if (existingIsRicher &&
+        existing.merchant.isNotEmpty &&
+        existing.merchant != '未识别商户') {
       mergedMerchant = existing.merchant;
     } else {
       mergedMerchant = _pickPreferredText(
@@ -1245,12 +1322,13 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       preferIncoming: promoteCapture,
     );
     final mergedCategoryId =
-        candidate.categoryId == 'shopping' ||
-            existing.categoryId == 'shopping' ||
-            capture.source.isShoppingSource ||
-            capture.relatedSources.any((item) => item.isShoppingSource)
-        ? 'shopping'
-        : candidate.categoryId;
+        aiCategoryId ??
+        (candidate.categoryId == 'shopping' ||
+                existing.categoryId == 'shopping' ||
+                capture.source.isShoppingSource ||
+                capture.relatedSources.any((item) => item.isShoppingSource)
+            ? 'shopping'
+            : candidate.categoryId);
     final lockedFields = existing.manualOverrideFields.toSet();
     final mergedOccurredAt = existing.occurredAt.isBefore(candidate.occurredAt)
         ? existing.occurredAt
@@ -1495,22 +1573,39 @@ class LedgerController extends StateNotifier<LedgerViewState> {
   void _linkRefundBindings(List<LedgerEntry> entries) {
     final linkedRefundIds = <String>{};
     for (final e in entries) linkedRefundIds.addAll(e.linkedRefundEntryIds);
-    final refundEntries = entries.where((e) => e.type == EntryType.income && (e.tags.contains('退款') || e.tags.contains('平台退款') || e.sourceLabel.contains('退款') || e.title.contains('退款') || e.categoryId == 'refund')).toList();
+    final refundEntries = entries
+        .where(
+          (e) =>
+              e.type == EntryType.income &&
+              (e.tags.contains('退款') ||
+                  e.tags.contains('平台退款') ||
+                  e.sourceLabel.contains('退款') ||
+                  e.title.contains('退款') ||
+                  e.categoryId == 'refund'),
+        )
+        .toList();
     for (final refund in refundEntries) {
       if (linkedRefundIds.contains(refund.id)) continue;
       final candidateIndex = entries.indexWhere((expense) {
         if (expense.type != EntryType.expense) return false;
         if ((expense.amount - refund.amount).abs() > 0.009) return false;
         if (expense.occurredAt.isAfter(refund.occurredAt)) return false;
-        if (refund.occurredAt.difference(expense.occurredAt).inDays > 90) return false;
-        if (expense.merchant.isNotEmpty && expense.merchant == refund.merchant) return !expense.linkedRefundEntryIds.contains(refund.id);
-        if (expense.counterpartyName.isNotEmpty && expense.counterpartyName == refund.counterpartyName) return !expense.linkedRefundEntryIds.contains(refund.id);
-        if (expense.sourceLabel == refund.sourceLabel) return !expense.linkedRefundEntryIds.contains(refund.id);
+        if (refund.occurredAt.difference(expense.occurredAt).inDays > 90)
+          return false;
+        if (expense.merchant.isNotEmpty && expense.merchant == refund.merchant)
+          return !expense.linkedRefundEntryIds.contains(refund.id);
+        if (expense.counterpartyName.isNotEmpty &&
+            expense.counterpartyName == refund.counterpartyName)
+          return !expense.linkedRefundEntryIds.contains(refund.id);
+        if (expense.sourceLabel == refund.sourceLabel)
+          return !expense.linkedRefundEntryIds.contains(refund.id);
         return false;
       });
       if (candidateIndex != -1) {
         final target = entries[candidateIndex];
-        entries[candidateIndex] = target.copyWith(linkedRefundEntryIds: [...target.linkedRefundEntryIds, refund.id]);
+        entries[candidateIndex] = target.copyWith(
+          linkedRefundEntryIds: [...target.linkedRefundEntryIds, refund.id],
+        );
         linkedRefundIds.add(refund.id);
       }
     }
@@ -1705,6 +1800,21 @@ class AndroidAutoCaptureBridge {
           (map) => AutoCaptureRecord.fromJson(Map<String, dynamic>.from(map)),
         )
         .toList();
+  }
+
+  Future<void> acknowledgeRecords(List<AutoCaptureRecord> records) async {
+    if (!Platform.isAndroid || records.isEmpty) return;
+    await _channel.invokeMethod<void>('acknowledgeAutoRecords', {
+      'records': [
+        for (final record in records)
+          {
+            'id': record.id,
+            'rawBody': record.rawBody,
+            'detailSummary': record.detailSummary,
+            'amount': record.amount,
+          },
+      ],
+    });
   }
 }
 
@@ -2163,6 +2273,7 @@ String _fallbackCategoryIdForType(EntryType type) {
 }
 
 enum LocationTrackingMode { off, foregroundLazy, backgroundPrecise, ipRough }
+
 enum AssetType { wechat, alipay, bankCard, cash, other }
 
 class FavoriteLocation {
@@ -2197,16 +2308,17 @@ class FavoriteLocation {
     'defaultAmount': defaultAmount,
   };
 
-  factory FavoriteLocation.fromJson(Map<String, dynamic> json) => FavoriteLocation(
-    id: json['id'] as String,
-    name: json['name'] as String,
-    address: json['address'] as String,
-    latitude: (json['latitude'] as num).toDouble(),
-    longitude: (json['longitude'] as num).toDouble(),
-    categoryId: json['categoryId'] as String?,
-    defaultTitle: json['defaultTitle'] as String?,
-    defaultAmount: (json['defaultAmount'] as num?)?.toDouble(),
-  );
+  factory FavoriteLocation.fromJson(Map<String, dynamic> json) =>
+      FavoriteLocation(
+        id: json['id'] as String,
+        name: json['name'] as String,
+        address: json['address'] as String,
+        latitude: (json['latitude'] as num).toDouble(),
+        longitude: (json['longitude'] as num).toDouble(),
+        categoryId: json['categoryId'] as String?,
+        defaultTitle: json['defaultTitle'] as String?,
+        defaultAmount: (json['defaultAmount'] as num?)?.toDouble(),
+      );
 
   FavoriteLocation copyWith({
     String? id,
@@ -2224,9 +2336,15 @@ class FavoriteLocation {
       address: address ?? this.address,
       latitude: latitude ?? this.latitude,
       longitude: longitude ?? this.longitude,
-      categoryId: categoryId == _unset ? this.categoryId : categoryId as String?,
-      defaultTitle: defaultTitle == _unset ? this.defaultTitle : defaultTitle as String?,
-      defaultAmount: defaultAmount == _unset ? this.defaultAmount : defaultAmount as double?,
+      categoryId: categoryId == _unset
+          ? this.categoryId
+          : categoryId as String?,
+      defaultTitle: defaultTitle == _unset
+          ? this.defaultTitle
+          : defaultTitle as String?,
+      defaultAmount: defaultAmount == _unset
+          ? this.defaultAmount
+          : defaultAmount as double?,
     );
   }
 }
@@ -2279,12 +2397,14 @@ class CategorizationRule {
     'autoTags': autoTags,
   };
 
-  factory CategorizationRule.fromJson(Map<String, dynamic> json) => CategorizationRule(
-    id: json['id'] as String,
-    pattern: json['pattern'] as String,
-    categoryId: json['categoryId'] as String,
-    autoTags: (json['autoTags'] as List<dynamic>? ?? const []).cast<String>(),
-  );
+  factory CategorizationRule.fromJson(Map<String, dynamic> json) =>
+      CategorizationRule(
+        id: json['id'] as String,
+        pattern: json['pattern'] as String,
+        categoryId: json['categoryId'] as String,
+        autoTags: (json['autoTags'] as List<dynamic>? ?? const [])
+            .cast<String>(),
+      );
 }
 
 enum ExpenseMood {
@@ -2437,11 +2557,16 @@ class LedgerEntry {
     channel: PaymentChannel.values.byName(json['channel'] as String),
     occurredAt: DateTime.parse(json['occurredAt'] as String),
     tags: (json['tags'] as List<dynamic>? ?? const []).cast<String>(),
-    linkedRefundEntryIds: (json['linkedRefundEntryIds'] as List<dynamic>? ?? const []).cast<String>(),
+    linkedRefundEntryIds:
+        (json['linkedRefundEntryIds'] as List<dynamic>? ?? const [])
+            .cast<String>(),
     locationInfo: json['locationInfo'] as String? ?? '',
     latitude: (json['latitude'] as num?)?.toDouble(),
     longitude: (json['longitude'] as num?)?.toDouble(),
-    mood: ExpenseMood.values.firstWhere((e) => e.name == json['mood'], orElse: () => ExpenseMood.none),
+    mood: ExpenseMood.values.firstWhere(
+      (e) => e.name == json['mood'],
+      orElse: () => ExpenseMood.none,
+    ),
     autoCaptured: json['autoCaptured'] as bool? ?? false,
     sourceLabel: json['sourceLabel'] as String? ?? '',
     autoMergeKey: json['autoMergeKey'] as String? ?? '',
@@ -2614,6 +2739,8 @@ class VaultSettings {
     this.voiceInputEnabled = true,
     this.locationMode = LocationTrackingMode.off,
     this.autoRecordLocation = false,
+    this.localAiModelId = 'qwen3-06b-q4',
+    this.autoAiCaptureEnabled = false,
   });
 
   final bool confidentialModeEnabled;
@@ -2634,6 +2761,8 @@ class VaultSettings {
   final bool voiceInputEnabled;
   final LocationTrackingMode locationMode;
   final bool autoRecordLocation;
+  final String localAiModelId;
+  final bool autoAiCaptureEnabled;
 
   Map<String, dynamic> toJson() => {
     'confidentialModeEnabled': confidentialModeEnabled,
@@ -2654,6 +2783,8 @@ class VaultSettings {
     'voiceInputEnabled': voiceInputEnabled,
     'locationMode': locationMode.name,
     'autoRecordLocation': autoRecordLocation,
+    'localAiModelId': localAiModelId,
+    'autoAiCaptureEnabled': autoAiCaptureEnabled,
   };
 
   factory VaultSettings.fromJson(Map<String, dynamic> json) => VaultSettings(
@@ -2674,8 +2805,13 @@ class VaultSettings {
     xianyuEnabled: json['xianyuEnabled'] as bool? ?? true,
     bankEnabled: json['bankEnabled'] as bool? ?? true,
     voiceInputEnabled: json['voiceInputEnabled'] as bool? ?? true,
-    locationMode: LocationTrackingMode.values.firstWhere((e) => e.name == (json['locationMode'] as String?), orElse: () => LocationTrackingMode.off),
+    locationMode: LocationTrackingMode.values.firstWhere(
+      (e) => e.name == (json['locationMode'] as String?),
+      orElse: () => LocationTrackingMode.off,
+    ),
     autoRecordLocation: json['autoRecordLocation'] as bool? ?? false,
+    localAiModelId: json['localAiModelId'] as String? ?? 'qwen3-06b-q4',
+    autoAiCaptureEnabled: json['autoAiCaptureEnabled'] as bool? ?? false,
   );
 
   VaultSettings copyWith({
@@ -2697,6 +2833,8 @@ class VaultSettings {
     bool? voiceInputEnabled,
     LocationTrackingMode? locationMode,
     bool? autoRecordLocation,
+    String? localAiModelId,
+    bool? autoAiCaptureEnabled,
   }) {
     return VaultSettings(
       confidentialModeEnabled:
@@ -2721,6 +2859,8 @@ class VaultSettings {
       voiceInputEnabled: voiceInputEnabled ?? this.voiceInputEnabled,
       locationMode: locationMode ?? this.locationMode,
       autoRecordLocation: autoRecordLocation ?? this.autoRecordLocation,
+      localAiModelId: localAiModelId ?? this.localAiModelId,
+      autoAiCaptureEnabled: autoAiCaptureEnabled ?? this.autoAiCaptureEnabled,
     );
   }
 }
@@ -2752,15 +2892,44 @@ class LedgerBook {
       subscriptions: const [],
       assetAccounts: const [],
       customRules: [
-        CategorizationRule(id: _uuid.v4(), pattern: '瑞幸', categoryId: 'food', autoTags: ['下午茶', '咖啡']),
-        CategorizationRule(id: _uuid.v4(), pattern: '喜茶', categoryId: 'food', autoTags: ['下午茶', '奶茶']),
-        CategorizationRule(id: _uuid.v4(), pattern: '星巴克', categoryId: 'food', autoTags: ['下午茶', '咖啡']),
-        CategorizationRule(id: _uuid.v4(), pattern: '淘宝', categoryId: 'shopping', autoTags: []),
-        CategorizationRule(id: _uuid.v4(), pattern: '饿了么', categoryId: 'food', autoTags: ['外卖']),
-        CategorizationRule(id: _uuid.v4(), pattern: '滴滴', categoryId: 'mobility', autoTags: ['打车']),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '瑞幸',
+          categoryId: 'food',
+          autoTags: ['下午茶', '咖啡'],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '喜茶',
+          categoryId: 'food',
+          autoTags: ['下午茶', '奶茶'],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '星巴克',
+          categoryId: 'food',
+          autoTags: ['下午茶', '咖啡'],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '淘宝',
+          categoryId: 'shopping',
+          autoTags: [],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '饿了么',
+          categoryId: 'food',
+          autoTags: ['外卖'],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '滴滴',
+          categoryId: 'mobility',
+          autoTags: ['打车'],
+        ),
       ],
       settings: VaultSettings(
-
         confidentialModeEnabled: confidentialModeEnabled,
         maskAmounts: confidentialModeEnabled,
         quickLockOnBackground: confidentialModeEnabled,
@@ -3032,14 +3201,38 @@ class LedgerBook {
       subscriptions: subscriptions,
       assetAccounts: const [],
       customRules: [
-        CategorizationRule(id: _uuid.v4(), pattern: '瑞幸', categoryId: 'food', autoTags: ['下午茶', '咖啡']),
-        CategorizationRule(id: _uuid.v4(), pattern: '喜茶', categoryId: 'food', autoTags: ['下午茶', '奶茶']),
-        CategorizationRule(id: _uuid.v4(), pattern: '星巴克', categoryId: 'food', autoTags: ['下午茶', '咖啡']),
-        CategorizationRule(id: _uuid.v4(), pattern: '美团', categoryId: 'food', autoTags: ['外卖']),
-        CategorizationRule(id: _uuid.v4(), pattern: '滴滴', categoryId: 'mobility', autoTags: ['打车']),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '瑞幸',
+          categoryId: 'food',
+          autoTags: ['下午茶', '咖啡'],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '喜茶',
+          categoryId: 'food',
+          autoTags: ['下午茶', '奶茶'],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '星巴克',
+          categoryId: 'food',
+          autoTags: ['下午茶', '咖啡'],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '美团',
+          categoryId: 'food',
+          autoTags: ['外卖'],
+        ),
+        CategorizationRule(
+          id: _uuid.v4(),
+          pattern: '滴滴',
+          categoryId: 'mobility',
+          autoTags: ['打车'],
+        ),
       ],
       settings: VaultSettings(
-
         confidentialModeEnabled: confidentialModeEnabled,
         maskAmounts: confidentialModeEnabled,
         quickLockOnBackground: confidentialModeEnabled,
@@ -3122,9 +3315,15 @@ class LedgerBook {
     settings: VaultSettings.fromJson(
       Map<String, dynamic>.from(json['settings'] as Map? ?? const {}),
     ),
-    assetAccounts: (json['assetAccounts'] as List<dynamic>? ?? []).map((e) => AssetAccount.fromJson(e as Map<String, dynamic>)).toList(),
-    customRules: (json['customRules'] as List<dynamic>? ?? []).map((e) => CategorizationRule.fromJson(e as Map<String, dynamic>)).toList(),
-    favoriteLocations: (json['favoriteLocations'] as List<dynamic>? ?? []).map((e) => FavoriteLocation.fromJson(e as Map<String, dynamic>)).toList(),
+    assetAccounts: (json['assetAccounts'] as List<dynamic>? ?? [])
+        .map((e) => AssetAccount.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    customRules: (json['customRules'] as List<dynamic>? ?? [])
+        .map((e) => CategorizationRule.fromJson(e as Map<String, dynamic>))
+        .toList(),
+    favoriteLocations: (json['favoriteLocations'] as List<dynamic>? ?? [])
+        .map((e) => FavoriteLocation.fromJson(e as Map<String, dynamic>))
+        .toList(),
   );
 
   LedgerBook copyWith({
@@ -3431,7 +3630,8 @@ bool _containsHint(String lowercase, List<String> hints) =>
   ].join(' ');
   final lowercase = combined.toLowerCase();
   for (final rule in book.customRules) {
-    if (rule.pattern.isNotEmpty && lowercase.contains(rule.pattern.toLowerCase())) {
+    if (rule.pattern.isNotEmpty &&
+        lowercase.contains(rule.pattern.toLowerCase())) {
       return (rule.categoryId, rule.autoTags);
     }
   }
@@ -3695,7 +3895,7 @@ String _extractLegacyCounterpartyName(LedgerEntry entry) {
     return entry.counterpartyName.trim();
   }
   final noteMatch = RegExp(
-    r'(?:微信名字|支付宝名字|付款人|收款方)[：:]\\s*([^\\n]+)',
+    r'(?:微信名字|支付宝名字|付款人|收款方)[：:]\s*([^\r\n]+)',
   ).firstMatch(entry.note);
   final noteCandidate = noteMatch?.group(1)?.trim() ?? '';
   if (_looksLikePersonName(noteCandidate)) {
@@ -5597,125 +5797,131 @@ class _VaultUnlockScreenState extends ConsumerState<_VaultUnlockScreen> {
       padding: EdgeInsets.only(bottom: bottomInset),
       child: SingleChildScrollView(
         child: Center(
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 460),
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: _GlassCard(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 74,
-                    height: 74,
-                    decoration: BoxDecoration(
-                      gradient: const LinearGradient(
-                        colors: [Color(0xFF1E6CF7), Color(0xFF7B6FFF)],
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 460),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: _GlassCard(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 74,
+                      height: 74,
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          colors: [Color(0xFF1E6CF7), Color(0xFF7B6FFF)],
+                        ),
+                        borderRadius: BorderRadius.circular(24),
                       ),
-                      borderRadius: BorderRadius.circular(24),
+                      child: const Icon(
+                        Icons.lock_rounded,
+                        color: Colors.white,
+                        size: 34,
+                      ),
                     ),
-                    child: const Icon(
-                      Icons.lock_rounded,
-                      color: Colors.white,
-                      size: 34,
+                    const SizedBox(height: 18),
+                    Text(
+                      '保险库已锁定',
+                      style: GoogleFonts.spaceGrotesk(
+                        fontSize: 28,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 18),
-                  Text(
-                    '保险库已锁定',
-                    style: GoogleFonts.spaceGrotesk(
-                      fontSize: 28,
-                      fontWeight: FontWeight.w700,
+                    const SizedBox(height: 8),
+                    Text(
+                      '输入你的机密口令，继续管理生活账本与自动记账。',
+                      textAlign: TextAlign.center,
+                      style: GoogleFonts.plusJakartaSans(
+                        color: const Color(0xFF5F6E87),
+                      ),
                     ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    '输入你的机密口令，继续管理生活账本与自动记账。',
-                    textAlign: TextAlign.center,
-                    style: GoogleFonts.plusJakartaSans(
-                      color: const Color(0xFF5F6E87),
-                    ),
-                  ),
-                  const SizedBox(height: 20),
-                  TextField(
-                    controller: _passphraseController,
-                    obscureText: _obscure,
-                    decoration: InputDecoration(
-                      labelText: '机密口令',
-                      suffixIcon: IconButton(
-                        onPressed: () => setState(() => _obscure = !_obscure),
-                        icon: Icon(
-                          _obscure ? Icons.visibility_off : Icons.visibility,
+                    const SizedBox(height: 20),
+                    TextField(
+                      controller: _passphraseController,
+                      obscureText: _obscure,
+                      decoration: InputDecoration(
+                        labelText: '机密口令',
+                        suffixIcon: IconButton(
+                          onPressed: () => setState(() => _obscure = !_obscure),
+                          icon: Icon(
+                            _obscure ? Icons.visibility_off : Icons.visibility,
+                          ),
                         ),
                       ),
+                      onSubmitted: (_) {
+                        FocusScope.of(context).unfocus();
+                        controller.unlockVault(_passphraseController.text);
+                      },
                     ),
-                    onSubmitted: (_) {
-                      FocusScope.of(context).unfocus();
-                      controller.unlockVault(_passphraseController.text);
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton(
-                      onPressed: state.busy
-                          ? null
-                          : () {
-                              FocusScope.of(context).unfocus();
-                              controller.unlockVault(
-                                _passphraseController.text,
-                              );
-                            },
-                      child: Text(state.busy ? '正在解锁...' : '解锁账本'),
-                    ),
-                  ),
-                  if (state.biometricAvailable) ...[
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 16),
                     SizedBox(
                       width: double.infinity,
-                      child: OutlinedButton.icon(
+                      child: FilledButton(
                         onPressed: state.busy
                             ? null
                             : () {
                                 FocusScope.of(context).unfocus();
-                                controller.unlockWithBiometric();
+                                controller.unlockVault(
+                                  _passphraseController.text,
+                                );
                               },
-                        icon: const Icon(Icons.fingerprint_rounded),
-                        label: Text(state.busy ? '正在校验指纹...' : '指纹解锁'),
+                        child: Text(state.busy ? '正在解锁...' : '解锁账本'),
                       ),
                     ),
-                    const SizedBox(height: 10),
-                    Text(
-                      '先手动口令解锁一次，并在机密页开启指纹解锁，之后就可以直接用指纹进入账本。',
-                      textAlign: TextAlign.center,
-                      style: GoogleFonts.plusJakartaSans(
-                        color: const Color(0xFF73809A),
-                        height: 1.45,
+                    if (state.biometricAvailable) ...[
+                      const SizedBox(height: 12),
+                      SizedBox(
+                        width: double.infinity,
+                        child: OutlinedButton.icon(
+                          onPressed: state.busy
+                              ? null
+                              : () {
+                                  FocusScope.of(context).unfocus();
+                                  controller.unlockWithBiometric();
+                                },
+                          icon: const Icon(Icons.fingerprint_rounded),
+                          label: Text(state.busy ? '正在校验指纹...' : '指纹解锁'),
+                        ),
                       ),
-                    ),
-                  ],
-                  const SizedBox(height: 16),
-                  TextButton(
-                    onPressed: () => _confirmReset(context, controller),
-                    child: const Text(
-                      '忘记口令？重置账本',
-                      style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
-                    ),
-                  ),
-                  if (state.errorMessage != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8),
-                      child: Text(
-                        state.errorMessage!,
-                        style: const TextStyle(color: Colors.redAccent, fontSize: 13),
+                      const SizedBox(height: 10),
+                      Text(
+                        '先手动口令解锁一次，并在机密页开启指纹解锁，之后就可以直接用指纹进入账本。',
                         textAlign: TextAlign.center,
+                        style: GoogleFonts.plusJakartaSans(
+                          color: const Color(0xFF73809A),
+                          height: 1.45,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 16),
+                    TextButton(
+                      onPressed: () => _confirmReset(context, controller),
+                      child: const Text(
+                        '忘记口令？重置账本',
+                        style: TextStyle(
+                          color: Color(0xFF94A3B8),
+                          fontSize: 13,
+                        ),
                       ),
                     ),
-                ],
+                    if (state.errorMessage != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text(
+                          state.errorMessage!,
+                          style: const TextStyle(
+                            color: Colors.redAccent,
+                            fontSize: 13,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
           ),
-        ),
         ),
       ),
     );
@@ -6122,7 +6328,9 @@ class _EntryTile extends StatelessWidget {
                       ),
                     ),
                   ],
-                  if (entry.tags.isNotEmpty || entry.linkedRefundEntryIds.isNotEmpty || entry.locationInfo.isNotEmpty) ...[
+                  if (entry.tags.isNotEmpty ||
+                      entry.linkedRefundEntryIds.isNotEmpty ||
+                      entry.locationInfo.isNotEmpty) ...[
                     const SizedBox(height: 8),
                     Wrap(
                       crossAxisAlignment: WrapCrossAlignment.center,
@@ -6131,54 +6339,95 @@ class _EntryTile extends StatelessWidget {
                       children: [
                         if (entry.locationInfo.isNotEmpty)
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                            decoration: BoxDecoration(color: const Color(0xFFE8EAF6), borderRadius: BorderRadius.circular(6)),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFE8EAF6),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                const Icon(Icons.location_on, size: 11, color: Color(0xFF5C6BC0)),
+                                const Icon(
+                                  Icons.location_on,
+                                  size: 11,
+                                  color: Color(0xFF5C6BC0),
+                                ),
                                 const SizedBox(width: 2),
                                 Flexible(
                                   child: Text(
                                     entry.locationInfo,
                                     maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
-                                    style: GoogleFonts.plusJakartaSans(fontSize: 11, fontWeight: FontWeight.w600, color: const Color(0xFF5C6BC0)),
+                                    style: GoogleFonts.plusJakartaSans(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                      color: const Color(0xFF5C6BC0),
+                                    ),
                                   ),
                                 ),
                               ],
                             ),
                           ),
-                        if (entry.linkedRefundEntryIds.isNotEmpty && viewState.book != null)
-                          Builder(builder: (context) {
-                            final refundAmount = entry.linkedRefundEntryIds.map((id) => viewState.book!.entries.where((e) => e.id == id).firstOrNull?.amount ?? 0.0).fold<double>(0.0, (a, b) => a + b);
-                            return Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                              decoration: BoxDecoration(color: const Color(0xFFEBF8EE), borderRadius: BorderRadius.circular(6)),
-                              child: Text('已关联退款 +￥${refundAmount.toStringAsFixed(2)}', style: GoogleFonts.plusJakartaSans(fontSize: 11, fontWeight: FontWeight.w600, color: const Color(0xFF11A66A))),
-                            );
-                          }),
-                        ...entry.tags.take(3).map(
-
-                            (tag) => Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 4,
-                              ),
-                              decoration: BoxDecoration(
-                                color: const Color(0xFFE9EEF8),
-                                borderRadius: BorderRadius.circular(999),
-                              ),
-                              child: Text(
-                                tag,
-                                style: GoogleFonts.plusJakartaSans(
-                                  fontSize: 11,
-                                  fontWeight: FontWeight.w600,
-                                  color: const Color(0xFF53627B),
+                        if (entry.linkedRefundEntryIds.isNotEmpty &&
+                            viewState.book != null)
+                          Builder(
+                            builder: (context) {
+                              final refundAmount = entry.linkedRefundEntryIds
+                                  .map(
+                                    (id) =>
+                                        viewState.book!.entries
+                                            .where((e) => e.id == id)
+                                            .firstOrNull
+                                            ?.amount ??
+                                        0.0,
+                                  )
+                                  .fold<double>(0.0, (a, b) => a + b);
+                              return Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 3,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFEBF8EE),
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Text(
+                                  '已关联退款 +￥${refundAmount.toStringAsFixed(2)}',
+                                  style: GoogleFonts.plusJakartaSans(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: const Color(0xFF11A66A),
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ...entry.tags
+                            .take(3)
+                            .map(
+                              (tag) => Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFFE9EEF8),
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  tag,
+                                  style: GoogleFonts.plusJakartaSans(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w600,
+                                    color: const Color(0xFF53627B),
+                                  ),
                                 ),
                               ),
-                            ),
-                          ).toList(),
+                            )
+                            .toList(),
                       ],
                     ),
                   ],
@@ -6574,7 +6823,14 @@ class DashboardScreen extends ConsumerWidget {
                 ),
               ),
               const SizedBox(height: 22),
-              _SectionHeader(title: '目前我的资产', actionLabel: '管理', onTap: () => pushPremiumPage<void>(context, page: AssetAccountsView(book: book))),
+              _SectionHeader(
+                title: '目前我的资产',
+                actionLabel: '管理',
+                onTap: () => pushPremiumPage<void>(
+                  context,
+                  page: AssetAccountsView(book: book),
+                ),
+              ),
               const SizedBox(height: 12),
               AssetAccountsCard(book: book, viewState: viewState),
               const SizedBox(height: 12),
@@ -7967,6 +8223,8 @@ class InsightsScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 18),
+              LocalAiCard(book: book),
+              const SizedBox(height: 18),
               MoodConsumptionChartCard(book: book),
               const SizedBox(height: 18),
               _GlassCard(
@@ -8031,119 +8289,151 @@ class InsightsScreen extends StatelessWidget {
                       ),
                       borderRadius: BorderRadius.circular(14),
                     ),
-                    child: const Icon(Icons.map_rounded, color: Colors.white, size: 22),
+                    child: const Icon(
+                      Icons.map_rounded,
+                      color: Colors.white,
+                      size: 22,
+                    ),
                   ),
-                  title: Text('消费地图', style: GoogleFonts.spaceGrotesk(fontWeight: FontWeight.w700)),
+                  title: Text(
+                    '消费地图',
+                    style: GoogleFonts.spaceGrotesk(
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
                   subtitle: Text(
                     '查看你的钱都花在了哪里',
-                    style: GoogleFonts.plusJakartaSans(color: const Color(0xFF60708A)),
+                    style: GoogleFonts.plusJakartaSans(
+                      color: const Color(0xFF60708A),
+                    ),
                   ),
-                  trailing: const Icon(Icons.chevron_right, color: Color(0xFF5C6BC0)),
-                  onTap: () => pushPremiumPage<void>(context, page: LocationSpendMapPage(book: book)),
+                  trailing: const Icon(
+                    Icons.chevron_right,
+                    color: Color(0xFF5C6BC0),
+                  ),
+                  onTap: () => pushPremiumPage<void>(
+                    context,
+                    page: LocationSpendMapPage(book: book),
+                  ),
                 ),
               ),
               const SizedBox(height: 22),
               // --- Region Spend Analysis ---
               _SectionHeader(title: '区域消费分布', actionLabel: '', onTap: null),
               const SizedBox(height: 12),
-              Builder(builder: (context) {
-                final regions = regionSpendAnalysis(book);
-                if (regions.isEmpty) {
-                  return _GlassCard(
-                    child: Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(20),
-                        child: Text(
-                          '暂无位置数据，开启位置记账后这里会展示各区域消费占比。',
-                          textAlign: TextAlign.center,
-                          style: GoogleFonts.plusJakartaSans(color: const Color(0xFF60708A)),
-                        ),
-                      ),
-                    ),
-                  );
-                }
-                final top5 = regions.take(5).toList();
-                final total = top5.fold<double>(0, (s, r) => s + r.amount);
-                const regionColors = [
-                  Color(0xFF5C6BC0), Color(0xFF26A69A), Color(0xFFFF7043),
-                  Color(0xFFAB47BC), Color(0xFF42A5F5),
-                ];
-                return _GlassCard(
-                  child: Column(
-                    children: [
-                      SizedBox(
-                        height: 180,
-                        child: RepaintBoundary(
-                          child: PieChart(
-                            PieChartData(
-                              sectionsSpace: 3,
-                              centerSpaceRadius: 40,
-                              sections: [
-                                for (var i = 0; i < top5.length; i++)
-                                  PieChartSectionData(
-                                    value: top5[i].amount,
-                                    title: top5[i].region,
-                                    color: regionColors[i % regionColors.length],
-                                    radius: 46,
-                                    titleStyle: GoogleFonts.plusJakartaSans(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.white,
-                                    ),
-                                  ),
-                              ],
+              Builder(
+                builder: (context) {
+                  final regions = regionSpendAnalysis(book);
+                  if (regions.isEmpty) {
+                    return _GlassCard(
+                      child: Center(
+                        child: Padding(
+                          padding: const EdgeInsets.all(20),
+                          child: Text(
+                            '暂无位置数据，开启位置记账后这里会展示各区域消费占比。',
+                            textAlign: TextAlign.center,
+                            style: GoogleFonts.plusJakartaSans(
+                              color: const Color(0xFF60708A),
                             ),
                           ),
                         ),
                       ),
-                      const SizedBox(height: 12),
-                      for (var i = 0; i < top5.length; i++)
-                        Padding(
-                          padding: const EdgeInsets.only(bottom: 8),
-                          child: Row(
-                            children: [
-                              Container(
-                                width: 12, height: 12,
-                                decoration: BoxDecoration(
-                                  color: regionColors[i % regionColors.length],
-                                  borderRadius: BorderRadius.circular(3),
-                                ),
+                    );
+                  }
+                  final top5 = regions.take(5).toList();
+                  final total = top5.fold<double>(0, (s, r) => s + r.amount);
+                  const regionColors = [
+                    Color(0xFF5C6BC0),
+                    Color(0xFF26A69A),
+                    Color(0xFFFF7043),
+                    Color(0xFFAB47BC),
+                    Color(0xFF42A5F5),
+                  ];
+                  return _GlassCard(
+                    child: Column(
+                      children: [
+                        SizedBox(
+                          height: 180,
+                          child: RepaintBoundary(
+                            child: PieChart(
+                              PieChartData(
+                                sectionsSpace: 3,
+                                centerSpaceRadius: 40,
+                                sections: [
+                                  for (var i = 0; i < top5.length; i++)
+                                    PieChartSectionData(
+                                      value: top5[i].amount,
+                                      title: top5[i].region,
+                                      color:
+                                          regionColors[i % regionColors.length],
+                                      radius: 46,
+                                      titleStyle: GoogleFonts.plusJakartaSans(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.white,
+                                      ),
+                                    ),
+                                ],
                               ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: Text(
-                                  top5[i].region,
-                                  style: GoogleFonts.plusJakartaSans(fontWeight: FontWeight.w600),
-                                ),
-                              ),
-                              Text(
-                                '${top5[i].count}笔',
-                                style: GoogleFonts.plusJakartaSans(
-                                  color: const Color(0xFF7A869C), fontSize: 12,
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Text(
-                                _safeCurrencyFormatter.format(top5[i].amount),
-                                style: GoogleFonts.spaceGrotesk(
-                                  fontWeight: FontWeight.w700,
-                                  color: regionColors[i % regionColors.length],
-                                ),
-                              ),
-                              const SizedBox(width: 8),
-                              Text(
-                                '${(top5[i].amount / total * 100).toStringAsFixed(0)}%',
-                                style: GoogleFonts.plusJakartaSans(
-                                  fontSize: 12, color: const Color(0xFF7A869C),
-                                ),
-                              ),
-                            ],
+                            ),
                           ),
                         ),
-                    ],
-                  ),
-                );
-              }),
+                        const SizedBox(height: 12),
+                        for (var i = 0; i < top5.length; i++)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Row(
+                              children: [
+                                Container(
+                                  width: 12,
+                                  height: 12,
+                                  decoration: BoxDecoration(
+                                    color:
+                                        regionColors[i % regionColors.length],
+                                    borderRadius: BorderRadius.circular(3),
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(
+                                    top5[i].region,
+                                    style: GoogleFonts.plusJakartaSans(
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                ),
+                                Text(
+                                  '${top5[i].count}笔',
+                                  style: GoogleFonts.plusJakartaSans(
+                                    color: const Color(0xFF7A869C),
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Text(
+                                  _safeCurrencyFormatter.format(top5[i].amount),
+                                  style: GoogleFonts.spaceGrotesk(
+                                    fontWeight: FontWeight.w700,
+                                    color:
+                                        regionColors[i % regionColors.length],
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  '${(top5[i].amount / total * 100).toStringAsFixed(0)}%',
+                                  style: GoogleFonts.plusJakartaSans(
+                                    fontSize: 12,
+                                    color: const Color(0xFF7A869C),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                      ],
+                    ),
+                  );
+                },
+              ),
             ],
           ),
         ),
@@ -8406,11 +8696,7 @@ class VaultScreen extends ConsumerWidget {
                 ),
               ),
               const SizedBox(height: 22),
-              _SectionHeader(
-                title: '语音输入',
-                actionLabel: '',
-                onTap: null,
-              ),
+              _SectionHeader(title: '语音输入', actionLabel: '', onTap: null),
               const SizedBox(height: 12),
               _GlassCard(
                 child: _SourceSwitchTile(
@@ -8424,11 +8710,7 @@ class VaultScreen extends ConsumerWidget {
               ),
 
               const SizedBox(height: 22),
-              _SectionHeader(
-                title: '空间与资产自动化',
-                actionLabel: '',
-                onTap: null,
-              ),
+              _SectionHeader(title: '空间与资产自动化', actionLabel: '', onTap: null),
               const SizedBox(height: 12),
               _GlassCard(
                 child: Column(
@@ -8437,28 +8719,51 @@ class VaultScreen extends ConsumerWidget {
                       value: book.settings.locationMode,
                       decoration: const InputDecoration(labelText: '位置记账助手模式'),
                       items: const [
-                        DropdownMenuItem(value: LocationTrackingMode.off, child: Text('关闭位置记录')),
-                        DropdownMenuItem(value: LocationTrackingMode.foregroundLazy, child: Text('前台懒加载模式 (推荐)')),
-                        DropdownMenuItem(value: LocationTrackingMode.ipRough, child: Text('网络 IP 粗略定位')),
-                        DropdownMenuItem(value: LocationTrackingMode.backgroundPrecise, child: Text('后台精确定位 (可能耗电)')),
+                        DropdownMenuItem(
+                          value: LocationTrackingMode.off,
+                          child: Text('关闭位置记录'),
+                        ),
+                        DropdownMenuItem(
+                          value: LocationTrackingMode.foregroundLazy,
+                          child: Text('前台懒加载模式 (推荐)'),
+                        ),
+                        DropdownMenuItem(
+                          value: LocationTrackingMode.ipRough,
+                          child: Text('网络 IP 粗略定位'),
+                        ),
+                        DropdownMenuItem(
+                          value: LocationTrackingMode.backgroundPrecise,
+                          child: Text('后台精确定位 (可能耗电)'),
+                        ),
                       ],
                       onChanged: (value) {
                         if (value == null) return;
-                        controller.updateSettings(book.settings.copyWith(locationMode: value));
+                        controller.updateSettings(
+                          book.settings.copyWith(locationMode: value),
+                        );
                       },
                     ),
                     SwitchListTile(
                       contentPadding: EdgeInsets.zero,
                       secondary: Container(
                         padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(color: const Color(0xFFE8F5E9), borderRadius: BorderRadius.circular(8)),
-                        child: const Icon(Icons.location_on, color: Color(0xFF43A047), size: 20),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFE8F5E9),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(
+                          Icons.location_on,
+                          color: Color(0xFF43A047),
+                          size: 20,
+                        ),
                       ),
                       title: const Text('自动记账记录位置'),
                       subtitle: const Text('自动记账时同步获取当前位置'),
                       value: book.settings.autoRecordLocation,
                       onChanged: (value) {
-                        controller.updateSettings(book.settings.copyWith(autoRecordLocation: value));
+                        controller.updateSettings(
+                          book.settings.copyWith(autoRecordLocation: value),
+                        );
                       },
                     ),
                     const SizedBox(height: 12),
@@ -8466,39 +8771,71 @@ class VaultScreen extends ConsumerWidget {
                       contentPadding: EdgeInsets.zero,
                       leading: Container(
                         padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(color: const Color(0xFFFFF3E0), borderRadius: BorderRadius.circular(8)),
-                        child: const Icon(Icons.bookmark_rounded, color: Color(0xFFFF7043), size: 20),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFFF3E0),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(
+                          Icons.bookmark_rounded,
+                          color: Color(0xFFFF7043),
+                          size: 20,
+                        ),
                       ),
                       title: const Text('常用地点管理'),
-                      subtitle: Text('已收藏 ${book.favoriteLocations.length} 个地点'),
+                      subtitle: Text(
+                        '已收藏 ${book.favoriteLocations.length} 个地点',
+                      ),
                       trailing: const Icon(Icons.chevron_right),
-                      onTap: () => pushPremiumPage<void>(context, page: FavoriteLocationsPage(book: book)),
+                      onTap: () => pushPremiumPage<void>(
+                        context,
+                        page: FavoriteLocationsPage(book: book),
+                      ),
                     ),
                     const SizedBox(height: 12),
                     ListTile(
                       contentPadding: EdgeInsets.zero,
                       leading: Container(
                         padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(color: const Color(0xFFE8EAF6), borderRadius: BorderRadius.circular(8)),
-                        child: const Icon(Icons.rule, color: Color(0xFF5C6BC0), size: 20),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFE8EAF6),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(
+                          Icons.rule,
+                          color: Color(0xFF5C6BC0),
+                          size: 20,
+                        ),
                       ),
                       title: const Text('自定义分类规则'),
                       subtitle: Text('已配置 ${book.customRules.length} 条规则'),
                       trailing: const Icon(Icons.chevron_right),
-                      onTap: () => pushPremiumPage<void>(context, page: SettingsCustomRulesView(book: book)),
+                      onTap: () => pushPremiumPage<void>(
+                        context,
+                        page: SettingsCustomRulesView(book: book),
+                      ),
                     ),
                     const SizedBox(height: 12),
                     ListTile(
                       contentPadding: EdgeInsets.zero,
                       leading: Container(
                         padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(color: const Color(0xFFE8EAF6), borderRadius: BorderRadius.circular(8)),
-                        child: const Icon(Icons.account_balance_wallet, color: Color(0xFF5C6BC0), size: 20),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFE8EAF6),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(
+                          Icons.account_balance_wallet,
+                          color: Color(0xFF5C6BC0),
+                          size: 20,
+                        ),
                       ),
                       title: const Text('资金账户池'),
                       subtitle: Text('已绑定 ${book.assetAccounts.length} 个期初资产'),
                       trailing: const Icon(Icons.chevron_right),
-                      onTap: () => pushPremiumPage<void>(context, page: AssetAccountsView(book: book)),
+                      onTap: () => pushPremiumPage<void>(
+                        context,
+                        page: AssetAccountsView(book: book),
+                      ),
                     ),
                   ],
                 ),
@@ -9078,92 +9415,162 @@ Future<void> showEntrySheet(
                       children: [
                         if (book.favoriteLocations.isNotEmpty)
                           IconButton(
-                            icon: const Icon(Icons.bookmark_rounded, color: Color(0xFFFF7043)),
+                            icon: const Icon(
+                              Icons.bookmark_rounded,
+                              color: Color(0xFFFF7043),
+                            ),
                             tooltip: '从收藏选择',
                             onPressed: () async {
-                              final selected = await showModalBottomSheet<FavoriteLocation>(
-                                context: context,
-                                builder: (ctx) => Container(
-                                  padding: const EdgeInsets.all(20),
-                                  decoration: const BoxDecoration(
-                                    color: Colors.white,
-                                    borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
-                                  ),
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text('常用地点', style: GoogleFonts.spaceGrotesk(fontSize: 18, fontWeight: FontWeight.w700)),
-                                      const SizedBox(height: 12),
-                                      ...book.favoriteLocations.map((fav) => ListTile(
-                                        leading: const Icon(Icons.location_on, color: Color(0xFF5C6BC0)),
-                                        title: Text(fav.name, style: const TextStyle(fontWeight: FontWeight.w600)),
-                                        subtitle: Text(fav.address, maxLines: 1, overflow: TextOverflow.ellipsis),
-                                        trailing: fav.categoryId != null
-                                            ? Icon(categoryForId(fav.categoryId!).icon, color: categoryForId(fav.categoryId!).color, size: 18)
-                                            : null,
-                                        onTap: () => Navigator.of(ctx).pop(fav),
-                                      )),
-                                    ],
-                                  ),
-                                ),
-                              );
+                              final selected =
+                                  await showModalBottomSheet<FavoriteLocation>(
+                                    context: context,
+                                    builder: (ctx) => Container(
+                                      padding: const EdgeInsets.all(20),
+                                      decoration: const BoxDecoration(
+                                        color: Colors.white,
+                                        borderRadius: BorderRadius.vertical(
+                                          top: Radius.circular(24),
+                                        ),
+                                      ),
+                                      child: Column(
+                                        mainAxisSize: MainAxisSize.min,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          Text(
+                                            '常用地点',
+                                            style: GoogleFonts.spaceGrotesk(
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 12),
+                                          ...book.favoriteLocations.map(
+                                            (fav) => ListTile(
+                                              leading: const Icon(
+                                                Icons.location_on,
+                                                color: Color(0xFF5C6BC0),
+                                              ),
+                                              title: Text(
+                                                fav.name,
+                                                style: const TextStyle(
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                              subtitle: Text(
+                                                fav.address,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                              trailing: fav.categoryId != null
+                                                  ? Icon(
+                                                      categoryForId(
+                                                        fav.categoryId!,
+                                                      ).icon,
+                                                      color: categoryForId(
+                                                        fav.categoryId!,
+                                                      ).color,
+                                                      size: 18,
+                                                    )
+                                                  : null,
+                                              onTap: () =>
+                                                  Navigator.of(ctx).pop(fav),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  );
                               if (selected != null) {
                                 setModalState(() {
                                   locationController.text = selected.address;
                                   entryLat = selected.latitude;
                                   entryLon = selected.longitude;
                                   // Apply template defaults
-                                  if (selected.defaultTitle != null && selected.defaultTitle!.isNotEmpty && titleController.text.isEmpty) {
-                                    titleController.text = selected.defaultTitle!;
+                                  if (selected.defaultTitle != null &&
+                                      selected.defaultTitle!.isNotEmpty &&
+                                      titleController.text.isEmpty) {
+                                    titleController.text =
+                                        selected.defaultTitle!;
                                   }
-                                  if (selected.defaultAmount != null && amountController.text.isEmpty) {
-                                    amountController.text = selected.defaultAmount!.toStringAsFixed(2);
+                                  if (selected.defaultAmount != null &&
+                                      amountController.text.isEmpty) {
+                                    amountController.text = selected
+                                        .defaultAmount!
+                                        .toStringAsFixed(2);
                                   }
                                   if (selected.categoryId != null) {
                                     categoryId = selected.categoryId!;
                                   }
-                                  nearbySummary = nearbySummaryForLocation(book, selected.address);
+                                  nearbySummary = nearbySummaryForLocation(
+                                    book,
+                                    selected.address,
+                                  );
                                 });
                               }
                             },
                           ),
                         IconButton(
-                          icon: const Icon(Icons.my_location, color: Color(0xFF5C6BC0)),
+                          icon: const Icon(
+                            Icons.my_location,
+                            color: Color(0xFF5C6BC0),
+                          ),
                           tooltip: '自动获取当前位置',
                           onPressed: () async {
                             setModalState(() {
                               locationController.text = '正在定位...';
                             });
                             try {
-                              final locResult = await LocationHelper.getDetailedLocation();
+                              final locResult =
+                                  await LocationHelper.getDetailedLocation();
                               if (!context.mounted) return;
                               if (locResult.isNotEmpty) {
                                 entryLat = locResult.latitude;
                                 entryLon = locResult.longitude;
                                 // Check favorite match
-                                final matchedFav = LocationHelper.findNearestFavorite(
-                                  locResult.latitude, locResult.longitude, book.favoriteLocations,
-                                );
+                                final matchedFav =
+                                    LocationHelper.findNearestFavorite(
+                                      locResult.latitude,
+                                      locResult.longitude,
+                                      book.favoriteLocations,
+                                    );
                                 if (matchedFav != null) {
-                                  if (matchedFav.defaultTitle != null && matchedFav.defaultTitle!.isNotEmpty && titleController.text.isEmpty) {
-                                    titleController.text = matchedFav.defaultTitle!;
+                                  if (matchedFav.defaultTitle != null &&
+                                      matchedFav.defaultTitle!.isNotEmpty &&
+                                      titleController.text.isEmpty) {
+                                    titleController.text =
+                                        matchedFav.defaultTitle!;
                                   }
-                                  if (matchedFav.defaultAmount != null && amountController.text.isEmpty) {
-                                    amountController.text = matchedFav.defaultAmount!.toStringAsFixed(2);
+                                  if (matchedFav.defaultAmount != null &&
+                                      amountController.text.isEmpty) {
+                                    amountController.text = matchedFav
+                                        .defaultAmount!
+                                        .toStringAsFixed(2);
                                   }
-                                  if (matchedFav.categoryId != null && context.mounted) {
-                                    setModalState(() => categoryId = matchedFav.categoryId!);
+                                  if (matchedFav.categoryId != null &&
+                                      context.mounted) {
+                                    setModalState(
+                                      () => categoryId = matchedFav.categoryId!,
+                                    );
                                   }
                                 }
                                 // Smart category from POI
                                 try {
-                                  final poi = await LocationHelper.getNearbyPOI(locResult.latitude, locResult.longitude);
+                                  final poi = await LocationHelper.getNearbyPOI(
+                                    locResult.latitude,
+                                    locResult.longitude,
+                                  );
                                   if (!context.mounted) return;
                                   if (poi.isNotEmpty) {
-                                    final suggestedCat = LocationHelper.suggestCategoryFromPOI(poi);
-                                    if (suggestedCat != null && matchedFav?.categoryId == null) {
-                                      setModalState(() => categoryId = suggestedCat);
+                                    final suggestedCat =
+                                        LocationHelper.suggestCategoryFromPOI(
+                                          poi,
+                                        );
+                                    if (suggestedCat != null &&
+                                        matchedFav?.categoryId == null) {
+                                      setModalState(
+                                        () => categoryId = suggestedCat,
+                                      );
                                     }
                                     if (merchantController.text.isEmpty) {
                                       merchantController.text = poi;
@@ -9172,8 +9579,14 @@ Future<void> showEntrySheet(
                                 } catch (_) {}
                                 if (context.mounted) {
                                   setModalState(() {
-                                    locationController.text = locResult.address.isNotEmpty ? locResult.address : '';
-                                    nearbySummary = nearbySummaryForLocation(book, locResult.address);
+                                    locationController.text =
+                                        locResult.address.isNotEmpty
+                                        ? locResult.address
+                                        : '';
+                                    nearbySummary = nearbySummaryForLocation(
+                                      book,
+                                      locResult.address,
+                                    );
                                   });
                                 }
                               } else {
@@ -9182,7 +9595,9 @@ Future<void> showEntrySheet(
                                     locationController.text = '';
                                   });
                                   ScaffoldMessenger.of(context).showSnackBar(
-                                    const SnackBar(content: Text('无法获取位置，请检查定位权限或GPS是否开启。')),
+                                    const SnackBar(
+                                      content: Text('无法获取位置，请检查定位权限或GPS是否开启。'),
+                                    ),
                                   );
                                 }
                               }
@@ -9206,14 +9621,21 @@ Future<void> showEntrySheet(
                   Padding(
                     padding: const EdgeInsets.only(top: 6),
                     child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 8,
+                      ),
                       decoration: BoxDecoration(
                         color: const Color(0xFFE8EAF6),
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: Row(
                         children: [
-                          const Icon(Icons.info_outline, size: 16, color: Color(0xFF5C6BC0)),
+                          const Icon(
+                            Icons.info_outline,
+                            size: 16,
+                            color: Color(0xFF5C6BC0),
+                          ),
                           const SizedBox(width: 8),
                           Expanded(
                             child: Text(
@@ -9240,7 +9662,10 @@ Future<void> showEntrySheet(
                 Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('这一单的心情状态: ${selectedMood.label} ${selectedMood.emoji}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                    Text(
+                      '这一单的心情状态: ${selectedMood.label} ${selectedMood.emoji}',
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    ),
                     const SizedBox(height: 8),
                     SingleChildScrollView(
                       scrollDirection: Axis.horizontal,
@@ -9256,7 +9681,9 @@ Future<void> showEntrySheet(
                                 setModalState(() => selectedMood = m);
                               },
                               selectedColor: m.color.withValues(alpha: 0.2),
-                              side: isSelected ? BorderSide(color: m.color, width: 2) : null,
+                              side: isSelected
+                                  ? BorderSide(color: m.color, width: 2)
+                                  : null,
                             ),
                           );
                         }).toList(),
@@ -9350,8 +9777,13 @@ Future<void> showEntrySheet(
                                 occurredAt: occurredAt,
                                 tags: parsedTags,
                                 locationInfo: locationController.text.trim(),
-                                latitude: locationController.text.trim().isEmpty ? null : entryLat,
-                                longitude: locationController.text.trim().isEmpty ? null : entryLon,
+                                latitude: locationController.text.trim().isEmpty
+                                    ? null
+                                    : entryLat,
+                                longitude:
+                                    locationController.text.trim().isEmpty
+                                    ? null
+                                    : entryLon,
                                 mood: selectedMood,
                                 autoCaptured: false,
                                 sourceLabel: '',
@@ -9370,8 +9802,12 @@ Future<void> showEntrySheet(
                           occurredAt: occurredAt,
                           tags: parsedTags,
                           locationInfo: locationController.text.trim(),
-                          latitude: locationController.text.trim().isEmpty ? null : entryLat,
-                          longitude: locationController.text.trim().isEmpty ? null : entryLon,
+                          latitude: locationController.text.trim().isEmpty
+                              ? null
+                              : entryLat,
+                          longitude: locationController.text.trim().isEmpty
+                              ? null
+                              : entryLon,
                           mood: selectedMood,
                         );
                         final protected = edited.copyWith(

@@ -68,7 +68,12 @@ class MainActivity : FlutterFragmentActivity() {
                 result.success(null)
             }
             "fetchPendingAutoRecords" -> {
-                result.success(AutoCaptureStore.drain(applicationContext).map { it.toMap() })
+                result.success(AutoCaptureStore.peek(applicationContext).map { it.toMap() })
+            }
+            "acknowledgeAutoRecords" -> {
+                val records = call.argument<List<Map<String, Any?>>>("records").orEmpty()
+                AutoCaptureStore.acknowledge(applicationContext, records)
+                result.success(null)
             }
             else -> result.notImplemented()
         }
