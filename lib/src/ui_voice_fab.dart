@@ -13,20 +13,61 @@ class VoiceRecordingFab extends StatefulWidget {
 }
 
 class _VoiceRecordingFabState extends State<VoiceRecordingFab>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _pulseCtrl;
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  late final AnimationController _pulseCtrl;
+  late final Animation<double> _scale;
+  Timer? _breathTimer;
+  bool _pressed = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _pulseCtrl = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 2000),
-    )..repeat(reverse: true);
+      duration: const Duration(milliseconds: 700),
+    );
+    _scale = Tween<double>(begin: 1, end: 1.05).animate(
+      CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut),
+    );
+    _startBreathing();
+  }
+
+  /// 每 5 秒轻轻呼吸一次。原来是一直 60fps 循环播放，
+  /// 实测停在首页什么都不做时也会一直重画、吃掉约半个 CPU 核。
+  void _startBreathing() {
+    _breathTimer?.cancel();
+    _breathTimer = Timer.periodic(const Duration(seconds: 12), (_) {
+      if (!mounted) return;
+      // 不在前台、或当前不是这个页面时不做动画。
+      if (!TickerMode.getNotifier(context).value) return;
+      unawaited(_breathe());
+    });
+  }
+
+  Future<void> _breathe() async {
+    try {
+      await _pulseCtrl.forward(from: 0);
+      if (mounted) await _pulseCtrl.reverse();
+    } catch (_) {
+      // 页面切走时动画会被取消，忽略即可。
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _startBreathing();
+    } else {
+      _breathTimer?.cancel();
+      _pulseCtrl.stop();
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _breathTimer?.cancel();
     _pulseCtrl.dispose();
     super.dispose();
   }
@@ -36,38 +77,50 @@ class _VoiceRecordingFabState extends State<VoiceRecordingFab>
     return Positioned(
       bottom: 20,
       right: 20,
-      child: AnimatedBuilder(
-        animation: _pulseCtrl,
-        builder: (context, child) {
-          final glow = 0.08 + (_pulseCtrl.value * 0.12);
-          return GestureDetector(
-            onTap: () {
-              HapticFeedback.mediumImpact();
-              _openQuickEntry(context);
-            },
-            child: Container(
-              width: 60,
-              height: 60,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: const LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [Color(0xFF3B82F6), Color(0xFF1D4ED8)],
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: const Color(0xFF3B82F6).withValues(alpha: glow),
-                    blurRadius: 20,
-                    spreadRadius: 4,
-                    offset: const Offset(0, 4),
-                  ),
-                ],
-              ),
-              child: const Icon(Icons.bolt_rounded, color: Colors.white, size: 28),
-            ),
-          );
+      child: GestureDetector(
+        onTapDown: (_) => setState(() => _pressed = true),
+        onTapUp: (_) => setState(() => _pressed = false),
+        onTapCancel: () => setState(() => _pressed = false),
+        onTap: () {
+          HapticFeedback.mediumImpact();
+          _openQuickEntry(context);
         },
+        // 按下时轻微缩一下，松手弹回；仍然只做缩放，不重新绘制阴影。
+        child: AnimatedScale(
+          scale: _pressed ? 0.9 : 1,
+          duration: const Duration(milliseconds: 130),
+          curve: Curves.easeOut,
+          child: ScaleTransition(
+            scale: _scale,
+            child: RepaintBoundary(
+              child: Container(
+                width: 60,
+                height: 60,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: const LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [Color(0xFF3B82F6), Color(0xFF1D4ED8)],
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF3B82F6).withValues(alpha: 0.18),
+                      blurRadius: 20,
+                      spreadRadius: 4,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: const Icon(
+                  Icons.bolt_rounded,
+                  color: Colors.white,
+                  size: 28,
+                ),
+              ),
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -104,8 +157,11 @@ class _QuickEntrySheet extends StatefulWidget {
 class _QuickEntrySheetState extends State<_QuickEntrySheet> with SingleTickerProviderStateMixin {
   final _ctrl = TextEditingController();
   final _focusNode = FocusNode();
+  final _speech = stt.SpeechToText();
   NlpExtractionResult? _preview;
   bool _submitting = false;
+  bool _listening = false;
+  bool _speechReady = false;
   late AnimationController _enterAnim;
 
   @override
@@ -117,6 +173,7 @@ class _QuickEntrySheetState extends State<_QuickEntrySheet> with SingleTickerPro
 
   @override
   void dispose() {
+    if (_listening) unawaited(_speech.stop());
     _ctrl.dispose();
     _focusNode.dispose();
     _enterAnim.dispose();
@@ -129,6 +186,80 @@ class _QuickEntrySheetState extends State<_QuickEntrySheet> with SingleTickerPro
     } else {
       setState(() => _preview = null);
     }
+  }
+
+  /// 直接说话记账：识别结果会填进输入框，识别完自动进入预览。
+  Future<void> _toggleListening() async {
+    if (_listening) {
+      await _speech.stop();
+      if (mounted) setState(() => _listening = false);
+      return;
+    }
+    if (!_speechReady) {
+      var available = false;
+      try {
+        available = await _speech.initialize(
+          onStatus: (status) {
+            if (!mounted) return;
+            if (status == 'done' || status == 'notListening') {
+              setState(() => _listening = false);
+            }
+          },
+          onError: (error) {
+            if (!mounted) return;
+            setState(() => _listening = false);
+            ScaffoldMessenger.of(widget.outerContext).showSnackBar(
+              const SnackBar(content: Text('没有听清，可以直接打字记账。')),
+            );
+          },
+        );
+      } catch (_) {
+        available = false;
+      }
+      if (!available) {
+        if (widget.outerContext.mounted) {
+          ScaffoldMessenger.of(widget.outerContext).showSnackBar(
+            const SnackBar(
+              content: Text('这台手机没有可用的语音识别，可以直接打字记账。'),
+            ),
+          );
+        }
+        return;
+      }
+      _speechReady = true;
+    }
+    String? localeId;
+    try {
+      final locales = await _speech.locales();
+      for (final locale in locales) {
+        if (locale.localeId.toLowerCase().startsWith('zh')) {
+          localeId = locale.localeId;
+          break;
+        }
+      }
+    } catch (_) {
+      localeId = null;
+    }
+    if (!mounted) return;
+    setState(() => _listening = true);
+    await _speech.listen(
+      onResult: (result) {
+        if (!mounted) return;
+        _ctrl.text = result.recognizedWords;
+        _ctrl.selection = TextSelection.fromPosition(
+          TextPosition(offset: _ctrl.text.length),
+        );
+        _onTextChanged(_ctrl.text);
+        if (result.finalResult) setState(() => _listening = false);
+      },
+      listenOptions: stt.SpeechListenOptions(
+        localeId: localeId,
+        partialResults: true,
+        cancelOnError: true,
+        listenFor: const Duration(seconds: 30),
+        pauseFor: const Duration(seconds: 3),
+      ),
+    );
   }
 
   Future<void> _submit(String val) async {
@@ -265,8 +396,8 @@ class _QuickEntrySheetState extends State<_QuickEntrySheet> with SingleTickerPro
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('智能速记', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, letterSpacing: -0.3)),
-                        Text('输入文字或用键盘语音 🎤', style: TextStyle(fontSize: 11, color: Colors.grey, height: 1.5)),
+                        Text('语音速记', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, letterSpacing: -0.3)),
+                        Text('点麦克风说一句，或直接打字', style: TextStyle(fontSize: 11, color: Colors.grey, height: 1.5)),
                       ],
                     ),
                   ),
@@ -275,7 +406,7 @@ class _QuickEntrySheetState extends State<_QuickEntrySheet> with SingleTickerPro
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                       decoration: BoxDecoration(
-                        color: p!.isIncome ? const Color(0xFFDCFCE7) : const Color(0xFFDBEAFE),
+                        color: p.isIncome ? const Color(0xFFDCFCE7) : const Color(0xFFDBEAFE),
                         borderRadius: BorderRadius.circular(20),
                       ),
                       child: Text(
@@ -311,7 +442,7 @@ class _QuickEntrySheetState extends State<_QuickEntrySheet> with SingleTickerPro
                   textInputAction: TextInputAction.done,
                   style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
                   decoration: InputDecoration(
-                    hintText: '星巴克咖啡35、打车15块、收入500...',
+                    hintText: _listening ? '正在听…例如“午饭35”' : '例如：午饭35、打车15块、收入500',
                     hintStyle: TextStyle(color: Colors.grey.shade400, fontSize: 14, fontWeight: FontWeight.w400),
                     filled: true,
                     fillColor: const Color(0xFFF8FAFC),
@@ -361,9 +492,18 @@ class _QuickEntrySheetState extends State<_QuickEntrySheet> with SingleTickerPro
                                 ),
                               ),
                             )
-                          : Padding(
-                              padding: const EdgeInsets.all(12),
-                              child: Icon(Icons.mic_none_rounded, color: Colors.grey.shade400, size: 22),
+                          : IconButton(
+                              tooltip: _listening ? '停止' : '说话记账',
+                              onPressed: _toggleListening,
+                              icon: Icon(
+                                _listening
+                                    ? Icons.stop_circle_rounded
+                                    : Icons.mic_none_rounded,
+                                color: _listening
+                                    ? const Color(0xFFE53935)
+                                    : const Color(0xFF3B82F6),
+                                size: 24,
+                              ),
                             ),
                     ),
                   ),
@@ -385,7 +525,7 @@ class _QuickEntrySheetState extends State<_QuickEntrySheet> with SingleTickerPro
                           gradient: LinearGradient(
                             begin: Alignment.topLeft,
                             end: Alignment.bottomRight,
-                            colors: p!.isIncome
+                            colors: p.isIncome
                                 ? [const Color(0xFFF0FDF4), const Color(0xFFDCFCE7)]
                                 : [const Color(0xFFEFF6FF), const Color(0xFFDBEAFE)],
                           ),

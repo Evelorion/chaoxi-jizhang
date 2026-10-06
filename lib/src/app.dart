@@ -26,6 +26,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:llama_flutter_android/llama_flutter_android.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 part 'ui_extensions.dart';
 part 'ui_predict_cards.dart';
@@ -34,6 +35,14 @@ part 'ui_voice_fab.dart';
 part 'location_helper.dart';
 part 'ui_location_map.dart';
 part 'local_ai.dart';
+part 'local_ai_download.dart';
+part 'local_ai_pages.dart';
+part 'local_ai_chat.dart';
+part 'local_capture.dart';
+part 'local_ledger_query.dart';
+part 'local_ledger_search.dart';
+part 'local_ledger_alerts.dart';
+part 'local_ledger_stats.dart';
 
 const _uuid = Uuid();
 const _ledgerFileName = 'chaoxi_vault.enc';
@@ -44,6 +53,214 @@ const _legacyEncryptedBackupFormats = {'jier.encrypted_backup.v1'};
 const _unset = Object();
 
 final _compactDateFormatter = DateFormat('yyyy-MM-dd');
+
+/// 千问自己也没把握的分类会打这个标签；你改过一次之后就会记住这个商户。
+const _needsReviewTag = '待确认';
+
+/// 从通知里认出"资金来源账户"：银行/支付通知常写"尾号8821""信用卡1234""****8821"。
+/// 认不出就返回空串 —— 宁可不填，也不编一个卡号出来。
+String extractFundingAccount(AutoCaptureRecord capture) {
+  final text = '${capture.detailSummary} ${capture.rawBody} ${capture.title}';
+  final tail = RegExp(
+    r'(?:尾号|卡号后四位|后四位|末四位|卡末四位)\s*[*＊]{0,4}\s*(\d{4})',
+  ).firstMatch(text)?.group(1);
+  final masked = tail ??
+      RegExp(r'[*＊]{2,}\s*(\d{4})').firstMatch(text)?.group(1);
+  if (masked == null || masked.isEmpty) return '';
+  final bank = RegExp(r'([\u4e00-\u9fa5]{2,6}银行)').firstMatch(text)?.group(1);
+  final label = (bank == null || bank.isEmpty)
+      ? capture.source.label
+      : bank;
+  return '$label ••$masked';
+}
+
+
+/// #3 记录一次"第二条通知比第一条晚到多久"，学这个 App 的通知延迟。
+Map<String, int> rememberCaptureDelay(
+  Map<String, int> profile,
+  CaptureSource source,
+  int deltaMs,
+) {
+  if (deltaMs <= 0) return profile;
+  final key = source.name;
+  final capped = deltaMs.clamp(0, 5 * 60 * 1000);
+  final existing = profile[key] ?? 0;
+  if (capped <= existing) return profile;
+  return {...profile, key: capped};
+}
+
+/// 学到的等待窗口：银行这类慢通知可以放宽，最少 90 秒。
+int captureWindowMs(Map<String, int> profile, CaptureSource source) {
+  final learned = profile[source.name] ?? 0;
+  return math.max(90 * 1000, learned);
+}
+
+/// #4 记录通知顺序：微信付款之后通常还会来一条银行通知。
+Map<String, int> rememberCaptureSequence(
+  Map<String, int> sequence,
+  CaptureSource from,
+  CaptureSource to,
+) {
+  if (from == to || from == CaptureSource.unknown || to == CaptureSource.unknown) {
+    return sequence;
+  }
+  final key = '${from.name}>${to.name}';
+  return {...sequence, key: (sequence[key] ?? 0) + 1};
+}
+
+/// 给界面看的一句话：最常出现的通知顺序。
+String topCaptureSequenceLabel(Map<String, int> sequence) {
+  if (sequence.isEmpty) return '';
+  final top = sequence.entries.toList()
+    ..sort((a, b) => b.value.compareTo(a.value));
+  final best = top.first;
+  if (best.value < 2) return '';
+  final parts = best.key.split('>');
+  if (parts.length != 2) return '';
+  final from = CaptureSource.values.firstWhere(
+    (item) => item.name == parts[0],
+    orElse: () => CaptureSource.unknown,
+  );
+  final to = CaptureSource.values.firstWhere(
+    (item) => item.name == parts[1],
+    orElse: () => CaptureSource.unknown,
+  );
+  if (from == CaptureSource.unknown || to == CaptureSource.unknown) return '';
+  return '常见顺序：${from.label} → ${to.label}（已见 ${best.value} 次）';
+}
+/// 通知模板：把数字/时间挖掉，只留文字骨架。
+/// "您账户尾号8821于19:36消费人民币36.80元" → "您账户尾号#于#消费人民币#元"
+/// 同一个 App 的同类通知骨架一样，复用够多次之后就不必再问模型。
+String captureTemplateSignature(AutoCaptureRecord capture) {
+  final text = '${capture.title} ${capture.rawBody} ${capture.detailSummary}'
+      .replaceAll(RegExp(r'\d+(?:[.:]\d+)*'), '#')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+  final skeleton = text.length > 60 ? text.substring(0, 60) : text;
+  return '${capture.source.name}|$skeleton';
+}
+
+/// 一个已经学会的通知模板。
+class CaptureTemplate {
+  const CaptureTemplate({
+    required this.categoryId,
+    this.hits = 1,
+    this.misses = 0,
+  });
+
+  /// 模型第一次判断出来的分类。
+  final String categoryId;
+
+  /// 这个骨架被成功复用了几次。
+  final int hits;
+
+  /// 用户改过几次（改过就说明模板不可信，要重新学）。
+  final int misses;
+
+  Map<String, dynamic> toJson() => {
+    'categoryId': categoryId,
+    'hits': hits,
+    'misses': misses,
+  };
+
+  factory CaptureTemplate.fromJson(Map<String, dynamic> json) =>
+      CaptureTemplate(
+        categoryId: json['categoryId'] as String? ?? '',
+        hits: (json['hits'] as num?)?.toInt() ?? 1,
+        misses: (json['misses'] as num?)?.toInt() ?? 0,
+      );
+}
+
+/// 模板要连续命中几次才算"可信"（防止一条特殊通知就把模板学歪）。
+const captureTemplateTrustThreshold = 3;
+
+/// 记录一次模板复用。
+Map<String, CaptureTemplate> rememberCaptureTemplate(
+  Map<String, CaptureTemplate> templates,
+  AutoCaptureRecord capture,
+  AiCaptureFields fields,
+) {
+  if (fields.categoryId.isEmpty) return templates;
+  final signature = captureTemplateSignature(capture);
+  final existing = templates[signature];
+  return {
+    ...templates,
+    signature: CaptureTemplate(
+      categoryId: fields.categoryId,
+      hits: (existing?.hits ?? 0) + 1,
+      misses: existing?.misses ?? 0,
+    ),
+  };
+}
+
+
+/// 模板是否已经可信（命中够多、且没被用户改过）。
+bool isCaptureTemplateTrusted(CaptureTemplate? template) =>
+    template != null &&
+    template.misses == 0 &&
+    template.hits >= captureTemplateTrustThreshold;
+
+/// 关联打分：判断两条通知是不是同一笔交易（0~100）。
+/// ≥90 程序直接合并；60~89 需要 AI 复核；<60 不作为候选。
+/// 金额相同只是其中一个条件 —— 单看金额会把"麦当劳20元"和"罗森20元"错并成一笔。
+int captureCorrelationScore(LedgerEntry entry, AutoCaptureRecord capture) {
+  if (entry.autoProfileId != capture.profileId) return 0;
+  if (entry.type != capture.entryType) return 0;
+  var score = 0;
+  final sameAmount =
+      entry.amount > 0 &&
+      capture.amount > 0 &&
+      (entry.amount - capture.amount).abs() < 0.01;
+  if (sameAmount) score += 40;
+
+  final delta = (_entryEventMillis(entry) - capture.postedAtMillis).abs();
+  if (delta <= const Duration(seconds: 10).inMilliseconds) {
+    score += 25;
+  } else if (delta <= const Duration(seconds: 30).inMilliseconds) {
+    score += 20;
+  } else if (delta <= const Duration(minutes: 2).inMilliseconds) {
+    score += 10;
+  }
+
+  final existingSource = CaptureSource.fromLabelOrUnknown(entry.sourceLabel);
+  final incoming = capture.source;
+  if (existingSource != CaptureSource.unknown && existingSource != incoming) {
+    final existingIsChannel = existingSource.isPaymentSource;
+    final incomingIsChannel = incoming.isPaymentSource;
+    final existingIsPlatform = existingSource.isShoppingSource;
+    final incomingIsPlatform = incoming.isShoppingSource;
+    if ((existingIsChannel && incomingIsPlatform) ||
+        (existingIsPlatform && incomingIsChannel)) {
+      score += 20;
+    } else if ((existingIsChannel && incoming == CaptureSource.bank) ||
+        (existingSource == CaptureSource.bank && incomingIsChannel)) {
+      score += 20;
+    } else if ((existingIsPlatform && incoming == CaptureSource.bank) ||
+        (existingSource == CaptureSource.bank && incomingIsPlatform)) {
+      score += 15;
+    }
+  }
+
+  // 同一张卡/同一个尾号，是很强的证据
+  final incomingAccount = extractFundingAccount(capture);
+  if (entry.fundingAccount.isNotEmpty &&
+      incomingAccount.isNotEmpty &&
+      entry.fundingAccount == incomingAccount) {
+    score += 25;
+  }
+
+  // 通知里明确写了"付款成功""消费"这类词
+  final paidKeywords = ['付款成功', '支付成功', '消费', '扣款', '支出'];
+  final incomingText = '${capture.title} ${capture.detailSummary} ${capture.rawBody}';
+  if (paidKeywords.any(incomingText.contains)) score += 10;
+
+  return score.clamp(0, 100);
+}
+
+/// 两个"银行 + 支付"的强关联候选同时存在时不要自动合并：宁可分成两笔让你核对，
+/// 也不要把两笔真实消费并成一笔。
+const captureAutoMergeThreshold = 90;
+
 final _safeCurrencyFormatter = NumberFormat.currency(
   locale: 'zh_CN',
   symbol: '\u00A5',
@@ -176,16 +393,70 @@ class LedgerRootPage extends ConsumerStatefulWidget {
 }
 
 class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   Timer? _syncTimer;
+  /// 切换标签时的一次性入场动画（淡入 + 轻微上浮），只跑 240 毫秒。
+  late final AnimationController _tabTransition;
+  late final Animation<double> _tabFade;
+  late final Animation<Offset> _tabSlide;
   Timer? _noticeTimer;
   Timer? _errorTimer;
   int _selectedIndex = 0;
+
+  // 五个页面在 IndexedStack 里都会参与构建。把它们的实例缓存下来，
+  // 顶部提示、错误提示这类变化就不会把五个页面全部重建一遍。
+  List<Widget>? _cachedScreens;
+  String? _cachedScreensKey;
+  LedgerBook? _cachedScreensBook;
+
+  List<Widget> _screensFor(LedgerViewState state, LedgerBook book) {
+    final key = [
+      state.initializing,
+      state.onboardingRequired,
+      state.locked,
+      state.biometricAvailable,
+      state.notificationAccessGranted,
+      state.revealAmounts,
+      state.busy,
+      state.lastAutoSyncAt?.millisecondsSinceEpoch ?? 0,
+    ].join('|');
+    final cached = _cachedScreens;
+    if (cached != null &&
+        _cachedScreensKey == key &&
+        identical(_cachedScreensBook, book)) {
+      return cached;
+    }
+    final screens = <Widget>[
+      DashboardScreen(book: book, viewState: state),
+      TransactionsScreen(book: book, viewState: state),
+      PlansScreen(book: book, viewState: state),
+      InsightsScreen(book: book, viewState: state),
+      VaultScreen(book: book, viewState: state),
+    ];
+    _cachedScreens = screens;
+    _cachedScreensKey = key;
+    _cachedScreensBook = book;
+    return screens;
+  }
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _tabTransition = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 240),
+      value: 1,
+    );
+    final tabCurve = CurvedAnimation(
+      parent: _tabTransition,
+      curve: Curves.easeOutCubic,
+    );
+    _tabFade = Tween<double>(begin: 0.72, end: 1).animate(tabCurve);
+    _tabSlide = Tween<Offset>(
+      begin: const Offset(0, 0.018),
+      end: Offset.zero,
+    ).animate(tabCurve);
     _syncTimer = Timer.periodic(const Duration(seconds: 20), (_) {
       ref
           .read(ledgerControllerProvider.notifier)
@@ -199,7 +470,15 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
     _syncTimer?.cancel();
     _noticeTimer?.cancel();
     _errorTimer?.cancel();
+    _tabTransition.dispose();
     super.dispose();
+  }
+
+  void _switchTab(int index) {
+    if (_selectedIndex == index) return;
+    setState(() => _selectedIndex = index);
+    // 一次性入场动画：不循环，所以不会一直占用 CPU。
+    _tabTransition.forward(from: 0);
   }
 
   void _scheduleTransientDismissals(
@@ -245,7 +524,7 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
       if (previous?.locked == true && next.canShowShell) {
         FocusManager.instance.primaryFocus?.unfocus();
         if (_selectedIndex != 0 && mounted) {
-          setState(() => _selectedIndex = 0);
+          _switchTab(0);
         }
       }
       _scheduleTransientDismissals(previous, next);
@@ -282,7 +561,7 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
               onSelected: (index) {
                 if (_selectedIndex == index) return;
                 HapticFeedback.selectionClick();
-                setState(() => _selectedIndex = index);
+                _switchTab(index);
               },
             )
           : null,
@@ -303,13 +582,7 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
     }
 
     final book = state.book!;
-    final screens = [
-      DashboardScreen(book: book, viewState: state),
-      TransactionsScreen(book: book, viewState: state),
-      PlansScreen(book: book, viewState: state),
-      InsightsScreen(book: book, viewState: state),
-      VaultScreen(book: book, viewState: state),
-    ];
+    final screens = _screensFor(state, book);
 
     final banners = <Widget>[
       if (state.noticeMessage case final notice?)
@@ -359,15 +632,21 @@ class _LedgerRootPageState extends ConsumerState<LedgerRootPage>
           ),
         ),
         Expanded(
-          child: IndexedStack(
-            index: _selectedIndex.clamp(0, screens.length - 1),
-            children: [
-              for (var i = 0; i < screens.length; i++)
-                TickerMode(
-                  enabled: _selectedIndex == i,
-                  child: KeyedSubtree(key: ValueKey(i), child: screens[i]),
-                ),
-            ],
+          child: FadeTransition(
+            opacity: _tabFade,
+            child: SlideTransition(
+              position: _tabSlide,
+              child: IndexedStack(
+                index: _selectedIndex.clamp(0, screens.length - 1),
+                children: [
+                  for (var i = 0; i < screens.length; i++)
+                    TickerMode(
+                      enabled: _selectedIndex == i,
+                      child: KeyedSubtree(key: ValueKey(i), child: screens[i]),
+                    ),
+                ],
+              ),
+            ),
           ),
         ),
       ],
@@ -391,6 +670,38 @@ class LedgerController extends StateNotifier<LedgerViewState> {
   final BiometricVaultBridge _biometricVaultBridge;
   String? _sessionPassphrase;
   bool _syncingAutoCapture = false;
+
+  /// #15 后台常驻：队列里还有货时，用前台服务把进程留住，
+  /// 定时把队列消化掉；队列清空就停掉服务，不白耗电。
+  Timer? _drainTimer;
+  bool _drainServiceRunning = false;
+
+  void _updateDrainService({required int pending}) {
+    if (pending <= 0) {
+      _drainTimer?.cancel();
+      _drainTimer = null;
+      if (_drainServiceRunning) {
+        _drainServiceRunning = false;
+        unawaited(_autoCaptureBridge.stopDrainService());
+      }
+      return;
+    }
+    if (!_drainServiceRunning) {
+      _drainServiceRunning = true;
+      unawaited(_autoCaptureBridge.startDrainService(pending));
+    }
+    _drainTimer ??= Timer.periodic(const Duration(seconds: 30), (_) {
+      // 只在没锁屏、没在同步的时候跑，避免重复劳动。
+      if (state.locked || _syncingAutoCapture) return;
+      unawaited(syncAutoCapturedEntries(silent: true));
+    });
+  }
+
+  @override
+  void dispose() {
+    _drainTimer?.cancel();
+    super.dispose();
+  }
 
   Future<void> initialize() async {
     state = state.copyWith(initializing: true, errorMessage: null);
@@ -569,6 +880,44 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     await _persistBook(updated, passphrase, notice: '账本规则已更新。');
   }
 
+  /// #13/#14 统计缓存：账本一变（updatedAt / 条数不同）就重建，
+  /// 天然不会和账本不一致；没变就直接复用。
+  LedgerStatsIndex? _statsIndex;
+  String _statsIndexKey = '';
+
+  LedgerStatsIndex statsIndexFor(LedgerBook book) {
+    final key = '${book.entries.length}|${book.updatedAt.millisecondsSinceEpoch}';
+    if (_statsIndex == null || _statsIndexKey != key) {
+      _statsIndex = buildLedgerStatsIndex(book);
+      _statsIndexKey = key;
+    }
+    return _statsIndex!;
+  }
+
+  /// 上一轮问账本的查询条件，用来支持"那交通呢""上个月呢"这类追问。
+  LedgerQuerySpec? _lastQuerySpec;
+  LedgerQuerySpec? get lastQuerySpec => _lastQuerySpec;
+
+  void rememberQuerySpec(LedgerQuerySpec? spec) {
+    _lastQuerySpec = spec;
+  }
+
+  Future<bool> saveAiConversation(
+    List<LedgerAiMessage> messages,
+    List<String> focusEntryIds,
+  ) async {
+    final book = state.book;
+    final passphrase = _sessionPassphrase;
+    if (book == null || passphrase == null) return false;
+    final updated = book.copyWith(
+      aiMessages: messages.skip(math.max(0, messages.length - 40)).toList(),
+      aiFocusEntryIds: focusEntryIds.take(80).toList(),
+      updatedAt: DateTime.now(),
+    );
+    await _persistBook(updated, passphrase);
+    return identical(state.book, updated);
+  }
+
   Future<void> updateBiometricUnlockEnabled(bool enabled) async {
     final book = state.book;
     if (book == null) return;
@@ -639,7 +988,12 @@ class LedgerController extends StateNotifier<LedgerViewState> {
   /// Fetches location asynchronously and patches the entry without blocking UI.
   Future<void> _backfillLocation(String entryId) async {
     try {
-      final locResult = await LocationHelper.getDetailedLocation();
+      final mode = state.book?.settings.locationMode;
+      final locResult = mode == LocationTrackingMode.ipRough
+          ? await LocationHelper.getApproximateLocation()
+          : await LocationHelper.getDetailedLocation(
+              forceRefresh: mode == LocationTrackingMode.backgroundPrecise,
+            );
       if (locResult.isEmpty) return;
 
       final currentBook = state.book;
@@ -675,16 +1029,45 @@ class LedgerController extends StateNotifier<LedgerViewState> {
 
     final index = book.entries.indexWhere((item) => item.id == entry.id);
     if (index == -1) return;
+    final previous = book.entries[index];
+
+    // 手动改过分类，说明这条已经核对过，把「待确认」标签摘掉。
+    final resolvedEntry = previous.categoryId == entry.categoryId
+        ? entry
+        : entry.copyWith(
+            tags: entry.tags
+                .where((tag) => tag != _needsReviewTag)
+                .toList(),
+          );
 
     final updatedEntries = [...book.entries];
-    updatedEntries[index] = entry;
+    updatedEntries[index] = resolvedEntry;
     updatedEntries.sort((a, b) => b.occurredAt.compareTo(a.occurredAt));
+
+    // 学会用户的修改：自动记账的分类被你改过，就记住这个商户以后该记哪一类，
+    // 下次同一个商户直接用，不用再问千问。
+    final learned = learnMerchantCategory(
+      book.merchantCategories,
+      previous,
+      entry,
+    );
+    final learnedMerchant = learned.length != book.merchantCategories.length
+        ? entry.merchant.trim()
+        : '';
 
     final updated = book.copyWith(
       entries: updatedEntries,
+      merchantCategories: learned,
       updatedAt: DateTime.now(),
     );
-    await _persistBook(updated, passphrase, notice: '流水已更新。');
+    await _persistBook(
+      updated,
+      passphrase,
+      notice: learnedMerchant.isEmpty
+          ? '流水已更新。'
+          : '流水已更新，并记住「$learnedMerchant」以后记'
+                '${categoryForId(entry.categoryId).name}。',
+    );
   }
 
   Future<void> deleteEntry(String entryId) async {
@@ -909,7 +1292,10 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     }
 
     final access = await _autoCaptureBridge.isNotificationAccessEnabled();
-    state = state.copyWith(notificationAccessGranted: access);
+    // 只有真的变了才更新状态。原来每 20 秒都写一次，会让整个界面无谓重建。
+    if (state.notificationAccessGranted != access) {
+      state = state.copyWith(notificationAccessGranted: access);
+    }
     if (!access) {
       if (!silent) {
         state = state.copyWith(errorMessage: '尚未授予通知读取权限，无法自动记账。');
@@ -917,7 +1303,13 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       return;
     }
 
-    final captures = await _autoCaptureBridge.fetchPendingRecords();
+    // 一轮只处理一小批：AI 顺序处理时新通知继续进队列，
+    // 监听和处理互不阻塞，剩下的下一轮（20 秒后）继续。
+    const batchSize = 12;
+    final pending = await _autoCaptureBridge.fetchPendingRecords();
+    final captures = pending.length > batchSize
+        ? pending.take(batchSize).toList()
+        : pending;
     if (captures.isEmpty) {
       if (!silent) {
         state = state.copyWith(
@@ -937,6 +1329,7 @@ class LedgerController extends StateNotifier<LedgerViewState> {
           ..sort((a, b) => a.postedAtMillis.compareTo(b.postedAtMillis));
 
     if (allowedCaptures.isEmpty) {
+      _updateDrainService(pending: 0);
       await _autoCaptureBridge.acknowledgeRecords(captures);
       state = state.copyWith(
         lastAutoSyncAt: DateTime.now(),
@@ -945,41 +1338,152 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       return;
     }
 
-    final aiModel = LocalAiModel.available.firstWhere(
-      (model) => model.id == book.settings.localAiModelId,
-      orElse: () => LocalAiModel.available.first,
+    // 记账用小模型：装了多个模型时，自动用最小的那个跑通知解析。
+    final aiModel = await _captureModelFor(book.settings);
+    // 通知的字段和分类全部由千问生成：没跑上模型的记录**留在队列里**等下一轮，
+    // 绝不先用规则拼一条半成品记进账本。
+    // 先看缓存：同一个商户千问只判断一次，之后直接复用它的结论。
+    final cachedCategories = applyMerchantCategoryCache(
+      book.merchantCategories,
+      allowedCaptures,
     );
-    final aiCategories = book.settings.autoAiCaptureEnabled
-        ? await classifyAutoCapturesLocally(allowedCaptures, aiModel)
-        : const <String, String>{};
-    if (aiCategories == null) return;
+    // 模板快路径：同一个 App 的同类通知见过够多次之后，直接复用结论，不问模型。
+    // 顺序很重要：商户缓存优先于模板 —— 你手动改过的分类要压过模板。
+    final templateHits = <String, String>{};
+    for (final capture in allowedCaptures) {
+      if (cachedCategories.containsKey(capture.id)) continue;
+      final template = book.captureTemplates[captureTemplateSignature(capture)];
+      if (isCaptureTemplateTrusted(template)) {
+        templateHits[capture.id] = template!.categoryId;
+      }
+    }
+    final needAi = allowedCaptures
+        .where(
+          (capture) =>
+              !cachedCategories.containsKey(capture.id) &&
+              !templateHits.containsKey(capture.id),
+        )
+        .toList();
+    final aiBatch = needAi.isEmpty
+        ? const LocalAiCaptureBatch.empty()
+        : await classifyCapturesWithAi(
+            needAi,
+            aiModel,
+            spec: book.settings.aiCaptureSpec,
+            // 用户自己配的分类规则直接交给千问遵守，规则仍然由用户说了算。
+            rules: book.customRules,
+          );
+    // 模型没跑上：整批留在队列里等下一轮（不是丢弃）。
+    if (aiBatch == null) return;
+    final aiFields = aiBatch.fields;
+    final fields = <String, AiCaptureFields>{
+      for (final entry in cachedCategories.entries)
+        entry.key: AiCaptureFields(
+          categoryId: entry.value,
+          title: '',
+          merchant: '',
+          counterparty: '',
+          tags: const [],
+        ),
+      for (final entry in templateHits.entries)
+        entry.key: AiCaptureFields(
+          categoryId: entry.value,
+          title: '',
+          merchant: '',
+          counterparty: '',
+          tags: const [],
+        ),
+      ...aiFields,
+    };
+    // 千问跑过但怎么都解析不出来的：按「待确认」落账，不能因为一次失败就把通知丢掉。
+    final needsReview = aiBatch.unresolved;
+    final readyCaptures = allowedCaptures
+        .where(
+          (capture) =>
+              fields.containsKey(capture.id) ||
+              needsReview.contains(capture.id),
+        )
+        .toList();
+    // 跑不上的留着，其它（含被策略忽略的）才算处理完。
+    final waiting = allowedCaptures.length - readyCaptures.length;
+    final ackList = captures
+        .where(
+          (capture) =>
+              !allowedCaptures.contains(capture) ||
+              fields.containsKey(capture.id),
+        )
+        .toList();
+    if (readyCaptures.isEmpty) {
+      _updateDrainService(pending: waiting);
+      state = state.copyWith(
+        lastAutoSyncAt: DateTime.now(),
+        noticeMessage: silent
+            ? state.noticeMessage
+            : '千问暂时没跑起来，$waiting 条通知先留在队列里，装好模型后会自动记账。',
+      );
+      return;
+    }
 
     final workingEntries = [...book.entries];
     var createdCount = 0;
     var updatedCount = 0;
+    final createdEntryIds = <String>{};
+    // 边用边学：这次合并的延迟和来源顺序都记下来。
+    var delayProfile = book.captureDelayProfile;
+    var sequence = book.captureSequence;
 
-    for (final capture in allowedCaptures) {
+    for (final capture in readyCaptures) {
+      // 千问这次没给出可用字段的，落账时标「待确认」，等你扫一眼。
+      final captureNeedsReview = needsReview.contains(capture.id);
       final sameIdIndex = workingEntries.indexWhere(
         (entry) => entry.id == capture.id,
       );
       if (sameIdIndex != -1) {
+        final before = workingEntries[sameIdIndex];
+        delayProfile = rememberCaptureDelay(
+          delayProfile,
+          capture.source,
+          (capture.postedAtMillis - _entryEventMillis(before)).abs(),
+        );
+        sequence = rememberCaptureSequence(
+          sequence,
+          CaptureSource.fromLabelOrUnknown(before.sourceLabel),
+          capture.source,
+        );
         workingEntries[sameIdIndex] = await _mergeEntryWithCapture(
           workingEntries[sameIdIndex],
           capture,
           book,
-          aiCategoryId: aiCategories[capture.id],
+          aiFields: fields[capture.id],
+          needsReview: captureNeedsReview,
         );
         updatedCount++;
         continue;
       }
 
-      final mergeIndex = _findMergeTargetIndex(workingEntries, capture);
+      final mergeIndex = _findMergeTargetIndex(
+        workingEntries,
+        capture,
+        book.captureDelayProfile,
+      );
       if (mergeIndex != -1) {
+        final before = workingEntries[mergeIndex];
+        delayProfile = rememberCaptureDelay(
+          delayProfile,
+          capture.source,
+          (capture.postedAtMillis - _entryEventMillis(before)).abs(),
+        );
+        sequence = rememberCaptureSequence(
+          sequence,
+          CaptureSource.fromLabelOrUnknown(before.sourceLabel),
+          capture.source,
+        );
         workingEntries[mergeIndex] = await _mergeEntryWithCapture(
           workingEntries[mergeIndex],
           capture,
           book,
-          aiCategoryId: aiCategories[capture.id],
+          aiFields: fields[capture.id],
+          needsReview: captureNeedsReview,
         );
         updatedCount++;
         continue;
@@ -988,17 +1492,19 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       final candidate = await _captureToEntry(
         capture,
         book,
-        aiCategoryId: aiCategories[capture.id],
+        aiFields: fields[capture.id],
+        needsReview: captureNeedsReview,
       );
       if (_containsSimilarAutoEntry(workingEntries, candidate)) {
         continue;
       }
       workingEntries.add(candidate);
       createdCount++;
+      createdEntryIds.add(candidate.id);
     }
 
     if (createdCount == 0 && updatedCount == 0) {
-      await _autoCaptureBridge.acknowledgeRecords(captures);
+      await _autoCaptureBridge.acknowledgeRecords(ackList);
       state = state.copyWith(
         lastAutoSyncAt: DateTime.now(),
         noticeMessage: silent ? state.noticeMessage : '自动记账通知已读取，无需新增或合并更新。',
@@ -1007,14 +1513,49 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     }
 
     _linkRefundBindings(workingEntries);
+    // 把这次千问的判断沉淀成模板：同类通知下次直接命中，不再问模型。
+    var templates = book.captureTemplates;
+    for (final capture in needAi) {
+      final captureFields = aiFields[capture.id];
+      if (captureFields != null) {
+        templates = rememberCaptureTemplate(templates, capture, captureFields);
+      }
+    }
+    // 统计这次走了哪条路，用来验证"越用越少依赖 AI"。
+    final pathStats = {...book.capturePathStats};
+    void bump(String key, int count) {
+      if (count > 0) pathStats[key] = (pathStats[key] ?? 0) + count;
+    }
+    bump('template', templateHits.length);
+    bump('cache', cachedCategories.length);
+    bump('ai', aiFields.length);
     final updatedBook = book.copyWith(
       entries: [...workingEntries]
         ..sort((a, b) => b.occurredAt.compareTo(a.occurredAt)),
+      // 记住这次千问判断过的商户，下次同一个商户不用再问模型。
+      merchantCategories: rememberMerchantCategories(
+        book.merchantCategories,
+        aiFields,
+        needAi,
+      ),
+      captureTemplates: templates,
+      capturePathStats: pathStats,
+      captureDelayProfile: delayProfile,
+      captureSequence: sequence,
       updatedAt: DateTime.now(),
     );
+    final backlog = pending.length - captures.length;
+    // 队列里还有货 → 让前台服务把进程留住继续消化；空了就停掉。
+    _updateDrainService(pending: backlog + waiting);
+    final reviewCount = readyCaptures
+        .where((capture) => needsReview.contains(capture.id))
+        .length;
     final summary = <String>[
       if (createdCount > 0) '$createdCount 笔新增',
       if (updatedCount > 0) '$updatedCount 笔合并更新',
+      if (reviewCount > 0) '$reviewCount 条已记为待确认',
+      if (waiting > 0) '还有 $waiting 条等千问处理',
+      if (backlog > 0) '另有 $backlog 条排队中',
     ].join('，');
     if (_sessionPassphrase != passphrase ||
         state.locked ||
@@ -1028,29 +1569,36 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       lastAutoSyncAt: DateTime.now(),
     );
     if (identical(state.book, updatedBook)) {
-      await _autoCaptureBridge.acknowledgeRecords(captures);
+      await _autoCaptureBridge.acknowledgeRecords(ackList);
     }
 
     // Backfill location for newly created entries (if enabled)
     if (identical(state.book, updatedBook) &&
         book.settings.autoRecordLocation &&
+        book.settings.locationMode != LocationTrackingMode.off &&
         createdCount > 0) {
-      for (final entry in workingEntries) {
-        if (entry.locationInfo.isEmpty) {
-          _backfillLocation(entry.id);
+      for (final entry in workingEntries.where(
+        (entry) => createdEntryIds.contains(entry.id),
+      )) {
+        if (DateTime.now().difference(entry.occurredAt).inMinutes.abs() <= 5) {
+          unawaited(_backfillLocation(entry.id));
         }
       }
     }
   }
 
+  /// 账本的字段由千问生成（标题/商户/对象/分类/标签）；
+  /// 金额和收支方向始终来自通知解析，模型碰不到这两项。
   Future<LedgerEntry> _captureToEntry(
     AutoCaptureRecord capture,
     LedgerBook book, {
-    String? aiCategoryId,
+    AiCaptureFields? aiFields,
+    bool needsReview = false,
   }) async {
-    final inferred = inferAutoCaptureCategoryId(book: book, capture: capture);
-    final resolvedCategoryId = inferred.$1;
-    final customTags = inferred.$2;
+    final categoryId = aiFields?.categoryId ??
+        (capture.entryType == EntryType.expense
+            ? resolveDefaultExpenseCategoryId(book.settings)
+            : _fallbackCategoryIdForType(EntryType.income));
     final displaySource = capture.source.isShoppingSource
         ? capture.source
         : capture.relatedSources.firstWhereOrNull(
@@ -1085,63 +1633,69 @@ class LedgerController extends StateNotifier<LedgerViewState> {
         '${capture.source.label}入账',
     }.toList();
 
-    // Try to get current location for auto-captured entries (respect setting)
-    String autoLocation = '';
-    double? autoLat;
-    double? autoLon;
-    String autoMerchant = capture.merchant;
-    if (book.settings.locationMode != LocationTrackingMode.off) {
-      try {
-        final locResult = await LocationHelper.getDetailedLocation();
-        if (locResult.isNotEmpty) {
-          autoLocation = locResult.address;
-          autoLat = locResult.latitude;
-          autoLon = locResult.longitude;
-          // Auto merchant identification via POI if merchant is empty
-          if (capture.merchant.isEmpty) {
-            try {
-              final poi = await LocationHelper.getNearbyPOI(
-                locResult.latitude,
-                locResult.longitude,
-              );
-              if (poi.isNotEmpty) autoMerchant = poi;
-            } catch (_) {}
-          }
-        }
-      } catch (_) {}
-    }
-
+    // 标题、商户、对象优先用千问按用户规范生成的结果。
+    final aiMerchant = aiFields?.merchant ?? '';
+    final aiCounterparty = aiFields?.counterparty ?? '';
+    final resolvedMerchant = aiMerchant.isNotEmpty
+        ? aiMerchant
+        : capture.merchant;
+    final resolvedCounterparty = aiCounterparty.isNotEmpty
+        ? aiCounterparty
+        : capture.counterpartyName;
+    final aiTitle = aiFields?.title ?? '';
     return LedgerEntry(
       id: capture.id,
-      title: buildAutoCaptureDisplayTitle(
-        source: displaySource,
-        scenario: capture.scenario,
-        merchant: capture.merchant,
-        counterpartyName: capture.counterpartyName,
-      ),
-      merchant: autoMerchant,
-      counterpartyName: capture.counterpartyName,
-      note: _normalizedAutoCaptureNote(
-        detailSummary: capture.detailSummary,
-        rawBody: capture.rawBody,
-        counterpartyName: capture.counterpartyName,
-        entryType: capture.entryType,
-      ),
+      title: aiTitle.isNotEmpty
+          ? aiTitle
+          : buildAutoCaptureDisplayTitle(
+              source: displaySource,
+              scenario: capture.scenario,
+              merchant: resolvedMerchant,
+              counterpartyName: resolvedCounterparty,
+            ),
+      merchant: resolvedMerchant,
+      counterpartyName: resolvedCounterparty,
+      // 备注和心情也是「新增支出」表单里的字段，由千问一起生成；
+      // 千问没给备注时保留通知原文，方便日后搜索。
+      note: (aiFields?.note.isNotEmpty ?? false)
+          ? aiFields!.note
+          : _normalizedAutoCaptureNote(
+              detailSummary: capture.detailSummary,
+              rawBody: capture.rawBody,
+              counterpartyName: resolvedCounterparty,
+              entryType: capture.entryType,
+            ),
+      mood: aiFields?.mood ?? ExpenseMood.none,
+      // 记录哪些字段是千问推测的（不是通知里的事实）。
+      inferredFields: (aiFields == null)
+          ? const <String>{}
+          : {
+              if (aiTitle.isNotEmpty) 'title',
+              if (aiMerchant.isNotEmpty) 'merchant',
+              if (aiCounterparty.isNotEmpty) 'counterpartyName',
+              'categoryId',
+              if (aiFields.tags.isNotEmpty) 'tags',
+              if (aiFields.note.isNotEmpty) 'note',
+              if (aiFields.mood != ExpenseMood.none) 'mood',
+            },
       amount: capture.amount,
       type: capture.entryType,
-      categoryId: aiCategoryId ?? resolvedCategoryId,
+      categoryId: categoryId,
       channel: capture.channel,
       occurredAt: DateTime.fromMillisecondsSinceEpoch(capture.postedAtMillis),
+      // 资金来源账户：商户、支付渠道、账户是三件事，分开存。
+      fundingAccount: extractFundingAccount(capture),
       tags: [
         ...sourceTags,
         scenarioLabel,
-        ...customTags,
-        if (aiCategoryId != null) '千问整理',
-        if (capture.confidence >= 0.85) '高置信度',
+        ...?aiFields?.tags,
+        if (aiFields != null) '千问整理',
+        // 千问自己也没把握：标出来让你扫一眼，改一次它就记住了。
+        if (needsReview ||
+            (aiFields != null && aiFields.categoryConfidence < 0.7))
+          _needsReviewTag,
       ],
-      locationInfo: autoLocation,
-      latitude: autoLat,
-      longitude: autoLon,
+      locationInfo: '',
       autoCaptured: true,
       sourceLabel: capture.source.label,
       autoMergeKey: capture.mergeKey,
@@ -1164,9 +1718,11 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     };
   }
 
+
   int _findMergeTargetIndex(
     List<LedgerEntry> entries,
     AutoCaptureRecord capture,
+    Map<String, int> delayProfile,
   ) {
     // --- Strategy 1: Exact match (same amount, tight window) ---
     final exactMatch = entries.lastIndexWhere((entry) {
@@ -1205,6 +1761,19 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     });
     if (exactMatch != -1) return exactMatch;
 
+    // --- Strategy 1.5: 关联打分 ---
+    // 银行扣款 + 支付通知这类组合（金额一致、卡尾号一致）用打分判断，
+    // ≥90 直接合并；存在多个同样强的候选时宁可不合并，避免把两笔真实消费并成一笔。
+    final strongCandidates = <int>[];
+    for (var i = 0; i < entries.length; i++) {
+      final entry = entries[i];
+      if (!entry.autoCaptured) continue;
+      if (captureCorrelationScore(entry, capture) >= captureAutoMergeThreshold) {
+        strongCandidates.add(i);
+      }
+    }
+    if (strongCandidates.length == 1) return strongCandidates.first;
+
     // --- Strategy 2: Cross-source enrichment (shopping → payment or vice versa) ---
     // When you buy on Taobao, you first get a Taobao notification (with store name),
     // then a WeChat/Alipay payment notification (with amount). These should merge.
@@ -1231,9 +1800,10 @@ class LedgerController extends StateNotifier<LedgerViewState> {
             (isCaptureFromShopping && existingSource.isPaymentSource);
         if (!isValidPair) return false;
 
-        // Tight time window for cross-source: 90 seconds (notifications arrive almost together)
+        // 跨来源的时间窗：一开始按 90 秒，学到某个 App 通知来得慢（比如银行）
+        // 就自动放宽到它实际的最大延迟，免得晚到的通知并不到一起。
         final delta = (_entryEventMillis(entry) - capture.postedAtMillis).abs();
-        if (delta > const Duration(seconds: 90).inMilliseconds) return false;
+        if (delta > captureWindowMs(delayProfile, capture.source)) return false;
 
         // Amount match (if both have amounts, they should be close)
         if (capture.amount > 0 && entry.amount > 0) {
@@ -1280,12 +1850,14 @@ class LedgerController extends StateNotifier<LedgerViewState> {
     LedgerEntry existing,
     AutoCaptureRecord capture,
     LedgerBook book, {
-    String? aiCategoryId,
+    AiCaptureFields? aiFields,
+    bool needsReview = false,
   }) async {
     final candidate = await _captureToEntry(
       capture,
       book,
-      aiCategoryId: aiCategoryId,
+      aiFields: aiFields,
+      needsReview: needsReview,
     );
     final existingSource = CaptureSource.fromLabelOrUnknown(
       existing.sourceLabel,
@@ -1327,13 +1899,11 @@ class LedgerController extends StateNotifier<LedgerViewState> {
       incoming: candidate.counterpartyName,
       preferIncoming: promoteCapture,
     );
+    // 分类以千问这次给出的结果为准；没有新结果就保留原记录的分类。
     final mergedCategoryId =
-        aiCategoryId ??
-        (candidate.categoryId == 'shopping' ||
-                existing.categoryId == 'shopping' ||
-                capture.source.isShoppingSource ||
-                capture.relatedSources.any((item) => item.isShoppingSource)
-            ? 'shopping'
+        aiFields?.categoryId ??
+        (existing.categoryId.isNotEmpty
+            ? existing.categoryId
             : candidate.categoryId);
     final lockedFields = existing.manualOverrideFields.toSet();
     final mergedOccurredAt = existing.occurredAt.isBefore(candidate.occurredAt)
@@ -1371,9 +1941,14 @@ class LedgerController extends StateNotifier<LedgerViewState> {
                   ? existing.type
                   : candidate.type,
             ),
+      // #7 冲突解析：金额以"更权威的来源"为准 —— 银行通知 > 支付渠道 > 电商平台。
+      // 三条通知都写了金额时，不能谁后到就用谁。
       amount: lockedFields.contains('amount')
           ? existing.amount
-          : candidate.amount,
+          : (existingSource == CaptureSource.bank &&
+                    capture.source != CaptureSource.bank
+                ? existing.amount
+                : candidate.amount),
       type: lockedFields.contains('type') ? existing.type : candidate.type,
       categoryId: lockedFields.contains('categoryId')
           ? existing.categoryId
@@ -1396,6 +1971,10 @@ class LedgerController extends StateNotifier<LedgerViewState> {
             }.toList(),
       autoCaptured: true,
       sourceLabel: mergedSourceLabel,
+      // 三条通知并成一条账时，谁先带来资金来源账户就留下它。
+      fundingAccount: existing.fundingAccount.isNotEmpty
+          ? existing.fundingAccount
+          : candidate.fundingAccount,
       autoMergeKey: capture.mergeKey.isNotEmpty
           ? capture.mergeKey
           : existing.autoMergeKey,
@@ -1828,6 +2407,58 @@ class AndroidAutoCaptureBridge {
       ],
     });
   }
+
+  /// 通知原文收件箱：用来核对"收到什么 → 记成了什么"。
+  Future<List<RawNotificationRecord>> fetchRawNotifications({
+    int limit = 60,
+  }) async {
+    if (!Platform.isAndroid) return const [];
+    final raw =
+        await _channel.invokeMethod<List<dynamic>>('fetchRawNotifications', {
+          'limit': limit,
+        }) ??
+        const [];
+    return raw
+        .whereType<Map>()
+        .map(
+          (map) =>
+              RawNotificationRecord.fromJson(Map<String, dynamic>.from(map)),
+        )
+        .toList();
+  }
+
+  Future<void> clearRawNotifications() async {
+    if (!Platform.isAndroid) return;
+    await _channel.invokeMethod<void>('clearRawNotifications');
+  }
+
+  /// 自动记账管道的运行情况（待处理、已解析、丢弃条数）。
+  Future<AutoCapturePipelineStats> fetchStats() async {
+    if (!Platform.isAndroid) return AutoCapturePipelineStats.empty;
+    final map = await _channel.invokeMapMethod<String, dynamic>(
+      'autoCaptureStats',
+    );
+    return AutoCapturePipelineStats.fromMap(map ?? const {});
+  }
+
+  /// #15 后台常驻：队列里还有货时把进程留住，队列清空就停掉，不白耗电。
+  Future<void> startDrainService(int pending) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod<bool>('startCaptureDrain', {
+        'pending': pending,
+      });
+    } catch (_) {
+      // 老系统/权限受限时静默失败，不影响前台记账。
+    }
+  }
+
+  Future<void> stopDrainService() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod<bool>('stopCaptureDrain');
+    } catch (_) {}
+  }
 }
 
 class AndroidWindowPrivacyBridge {
@@ -2111,7 +2742,7 @@ const appCategories = <AppCategory>[
     type: EntryType.expense,
     icon: Icons.home_rounded,
     color: Color(0xFF6A7BFF),
-    keywords: ['房租', '租', '物业', '电费', '燃气', '水费'],
+    keywords: ['房租', '租金', '租房', '房贷', '物业', '电费', '燃气', '水费'],
   ),
   AppCategory(
     id: 'mobility',
@@ -2167,7 +2798,17 @@ const appCategories = <AppCategory>[
     type: EntryType.expense,
     icon: Icons.family_restroom_rounded,
     color: Color(0xFFAB845A),
-    keywords: ['家', '宝宝', '亲子', 'parents', 'family'],
+    keywords: [
+      '家人',
+      '家庭',
+      '家用',
+      '亲子',
+      '宝宝',
+      '母婴',
+      '育儿',
+      'parents',
+      'family',
+    ],
   ),
   AppCategory(
     id: 'pets',
@@ -2176,7 +2817,7 @@ const appCategories = <AppCategory>[
     type: EntryType.expense,
     icon: Icons.pets_rounded,
     color: Color(0xFF4CB3A7),
-    keywords: ['宠', 'pet', '猫', '狗'],
+    keywords: ['宠物', 'pet', '猫粮', '猫砂', '狗粮', '狗狗'],
   ),
   AppCategory(
     id: 'travel',
@@ -2457,6 +3098,8 @@ class LedgerEntry {
     this.autoProfileId = -1,
     this.autoPostedAtMillis = -1,
     this.manualOverrideFields = const [],
+    this.fundingAccount = '',
+    this.inferredFields = const {},
   });
 
   final String id;
@@ -2477,6 +3120,15 @@ class LedgerEntry {
   final ExpenseMood mood;
   final bool autoCaptured;
   final String sourceLabel;
+
+  /// 资金来源账户，例如"招商银行 ••8821"。
+  /// 商户、支付渠道、资金来源是三件事：淘宝 / 微信支付 / 招商银行••8821。
+  final String fundingAccount;
+
+  /// #8：哪些字段是**推测**（千问判断）而不是通知里的事实。
+  /// FACT（金额/时间/收支/账户）永不重写；将来换更好的模型时只重跑这里面的字段。
+  final Set<String> inferredFields;
+
   final String autoMergeKey;
   final int autoProfileId;
   final int autoPostedAtMillis;
@@ -2505,6 +3157,8 @@ class LedgerEntry {
     int? autoProfileId,
     int? autoPostedAtMillis,
     List<String>? manualOverrideFields,
+    String? fundingAccount,
+    Set<String>? inferredFields,
   }) {
     return LedgerEntry(
       id: id ?? this.id,
@@ -2528,7 +3182,9 @@ class LedgerEntry {
       autoMergeKey: autoMergeKey ?? this.autoMergeKey,
       autoProfileId: autoProfileId ?? this.autoProfileId,
       autoPostedAtMillis: autoPostedAtMillis ?? this.autoPostedAtMillis,
+      fundingAccount: fundingAccount ?? this.fundingAccount,
       manualOverrideFields: manualOverrideFields ?? this.manualOverrideFields,
+      inferredFields: inferredFields ?? this.inferredFields,
     );
   }
 
@@ -2551,6 +3207,8 @@ class LedgerEntry {
     'mood': mood.name,
     'autoCaptured': autoCaptured,
     'sourceLabel': sourceLabel,
+    'fundingAccount': fundingAccount,
+    'inferredFields': inferredFields.toList(),
     'autoMergeKey': autoMergeKey,
     'autoProfileId': autoProfileId,
     'autoPostedAtMillis': autoPostedAtMillis,
@@ -2581,6 +3239,11 @@ class LedgerEntry {
     ),
     autoCaptured: json['autoCaptured'] as bool? ?? false,
     sourceLabel: json['sourceLabel'] as String? ?? '',
+    fundingAccount: json['fundingAccount'] as String? ?? '',
+    inferredFields:
+        (json['inferredFields'] as List<dynamic>? ?? const [])
+            .whereType<String>()
+            .toSet(),
     autoMergeKey: json['autoMergeKey'] as String? ?? '',
     autoProfileId: (json['autoProfileId'] as num?)?.toInt() ?? -1,
     autoPostedAtMillis:
@@ -2748,6 +3411,7 @@ class VaultSettings {
     required this.pinduoduoEnabled,
     required this.xianyuEnabled,
     required this.bankEnabled,
+    this.aiCaptureSpec = defaultAiCaptureSpec,
     this.voiceInputEnabled = true,
     this.locationMode = LocationTrackingMode.off,
     this.autoRecordLocation = false,
@@ -2770,6 +3434,9 @@ class VaultSettings {
   final bool pinduoduoEnabled;
   final bool xianyuEnabled;
   final bool bankEnabled;
+
+  /// 让千问按什么风格生成账单字段，用户可以在设置里改。
+  final String aiCaptureSpec;
   final bool voiceInputEnabled;
   final LocationTrackingMode locationMode;
   final bool autoRecordLocation;
@@ -2792,6 +3459,7 @@ class VaultSettings {
     'pinduoduoEnabled': pinduoduoEnabled,
     'xianyuEnabled': xianyuEnabled,
     'bankEnabled': bankEnabled,
+    'aiCaptureSpec': aiCaptureSpec,
     'voiceInputEnabled': voiceInputEnabled,
     'locationMode': locationMode.name,
     'autoRecordLocation': autoRecordLocation,
@@ -2816,6 +3484,7 @@ class VaultSettings {
     pinduoduoEnabled: json['pinduoduoEnabled'] as bool? ?? true,
     xianyuEnabled: json['xianyuEnabled'] as bool? ?? true,
     bankEnabled: json['bankEnabled'] as bool? ?? true,
+    aiCaptureSpec: json['aiCaptureSpec'] as String? ?? defaultAiCaptureSpec,
     voiceInputEnabled: json['voiceInputEnabled'] as bool? ?? true,
     locationMode: LocationTrackingMode.values.firstWhere(
       (e) => e.name == (json['locationMode'] as String?),
@@ -2842,6 +3511,7 @@ class VaultSettings {
     bool? pinduoduoEnabled,
     bool? xianyuEnabled,
     bool? bankEnabled,
+    String? aiCaptureSpec,
     bool? voiceInputEnabled,
     LocationTrackingMode? locationMode,
     bool? autoRecordLocation,
@@ -2868,6 +3538,7 @@ class VaultSettings {
       pinduoduoEnabled: pinduoduoEnabled ?? this.pinduoduoEnabled,
       xianyuEnabled: xianyuEnabled ?? this.xianyuEnabled,
       bankEnabled: bankEnabled ?? this.bankEnabled,
+      aiCaptureSpec: aiCaptureSpec ?? this.aiCaptureSpec,
       voiceInputEnabled: voiceInputEnabled ?? this.voiceInputEnabled,
       locationMode: locationMode ?? this.locationMode,
       autoRecordLocation: autoRecordLocation ?? this.autoRecordLocation,
@@ -2890,6 +3561,13 @@ class LedgerBook {
     this.assetAccounts = const [],
     this.customRules = const [],
     this.favoriteLocations = const [],
+    this.aiMessages = const [],
+    this.aiFocusEntryIds = const [],
+    this.merchantCategories = const {},
+    this.captureTemplates = const {},
+    this.capturePathStats = const {},
+    this.captureDelayProfile = const {},
+    this.captureSequence = const {},
   });
 
   factory LedgerBook.empty(bool confidentialModeEnabled) {
@@ -3269,6 +3947,28 @@ class LedgerBook {
   final DateTime updatedAt;
   final List<LedgerEntry> entries;
   final List<LedgerPeriod> periods;
+
+  /// 和本地千问的对话记忆（存在加密账本里）。
+  final List<LedgerAiMessage> aiMessages;
+
+  /// 上一轮命中的流水，用于"付款方是谁"这类追问。
+  final List<String> aiFocusEntryIds;
+
+  /// 商户 → 分类 的缓存（千问第一次判断后写入，之后不再问模型）。
+  final Map<String, String> merchantCategories;
+
+  /// 通知骨架 → 模板：学会之后同类通知不用再问模型。
+  final Map<String, CaptureTemplate> captureTemplates;
+
+  /// 自动记账走了哪条路：template(模板) / cache(商户缓存) / ai(千问)。
+  /// 用来验证"越用越少依赖 AI"。
+  final Map<String, int> capturePathStats;
+
+  /// 各 App 的通知延迟画像（来源 → 观察到的最大延迟毫秒）。
+  final Map<String, int> captureDelayProfile;
+
+  /// 通知顺序："微信>招商银行" 这类组合出现了几次。
+  final Map<String, int> captureSequence;
   final List<BudgetEnvelope> budgets;
   final List<SavingsGoal> goals;
   final List<RecurringPlan> subscriptions;
@@ -3282,6 +3982,15 @@ class LedgerBook {
     'updatedAt': updatedAt.toIso8601String(),
     'entries': entries.map((entry) => entry.toJson()).toList(),
     'periods': periods.map((item) => item.toJson()).toList(),
+    'aiMessages': aiMessages.map((item) => item.toJson()).toList(),
+    'aiFocusEntryIds': aiFocusEntryIds,
+    'merchantCategories': merchantCategories,
+    'captureTemplates': captureTemplates.map(
+      (key, value) => MapEntry(key, value.toJson()),
+    ),
+    'capturePathStats': capturePathStats,
+    'captureDelayProfile': captureDelayProfile,
+    'captureSequence': captureSequence,
     'budgets': budgets.map((item) => item.toJson()).toList(),
     'goals': goals.map((item) => item.toJson()).toList(),
     'subscriptions': subscriptions.map((item) => item.toJson()).toList(),
@@ -3300,6 +4009,35 @@ class LedgerBook {
               LedgerEntry.fromJson(Map<String, dynamic>.from(item as Map)),
         )
         .toList(),
+    aiMessages: (json['aiMessages'] as List<dynamic>? ?? const [])
+        .whereType<Map>()
+        .map((item) => LedgerAiMessage.fromJson(Map<String, dynamic>.from(item)))
+        .toList(),
+    aiFocusEntryIds: (json['aiFocusEntryIds'] as List<dynamic>? ?? const [])
+        .whereType<String>()
+        .toList(),
+    merchantCategories:
+        (json['merchantCategories'] as Map<dynamic, dynamic>? ?? const {})
+            .map((key, value) => MapEntry('$key', '$value')),
+    captureTemplates:
+        (json['captureTemplates'] as Map<dynamic, dynamic>? ?? const {}).map(
+          (key, value) => MapEntry(
+            '$key',
+            CaptureTemplate.fromJson(Map<String, dynamic>.from(value as Map)),
+          ),
+        ),
+    capturePathStats:
+        (json['capturePathStats'] as Map<dynamic, dynamic>? ?? const {}).map(
+          (key, value) => MapEntry('$key', (value as num).toInt()),
+        ),
+    captureDelayProfile:
+        (json['captureDelayProfile'] as Map<dynamic, dynamic>? ?? const {}).map(
+          (key, value) => MapEntry('$key', (value as num).toInt()),
+        ),
+    captureSequence:
+        (json['captureSequence'] as Map<dynamic, dynamic>? ?? const {}).map(
+          (key, value) => MapEntry('$key', (value as num).toInt()),
+        ),
     periods: (json['periods'] as List<dynamic>? ?? const [])
         .map(
           (item) =>
@@ -3343,6 +4081,13 @@ class LedgerBook {
     DateTime? updatedAt,
     List<LedgerEntry>? entries,
     List<LedgerPeriod>? periods,
+    List<LedgerAiMessage>? aiMessages,
+    List<String>? aiFocusEntryIds,
+    Map<String, String>? merchantCategories,
+    Map<String, CaptureTemplate>? captureTemplates,
+    Map<String, int>? capturePathStats,
+    Map<String, int>? captureDelayProfile,
+    Map<String, int>? captureSequence,
     List<BudgetEnvelope>? budgets,
     List<SavingsGoal>? goals,
     List<RecurringPlan>? subscriptions,
@@ -3363,6 +4108,13 @@ class LedgerBook {
       assetAccounts: assetAccounts ?? this.assetAccounts,
       customRules: customRules ?? this.customRules,
       favoriteLocations: favoriteLocations ?? this.favoriteLocations,
+      aiMessages: aiMessages ?? this.aiMessages,
+      aiFocusEntryIds: aiFocusEntryIds ?? this.aiFocusEntryIds,
+      merchantCategories: merchantCategories ?? this.merchantCategories,
+      captureTemplates: captureTemplates ?? this.captureTemplates,
+      capturePathStats: capturePathStats ?? this.capturePathStats,
+      captureDelayProfile: captureDelayProfile ?? this.captureDelayProfile,
+      captureSequence: captureSequence ?? this.captureSequence,
     );
   }
 
@@ -3626,21 +4378,28 @@ const _familyCounterpartyHints = <String>[
 bool _containsHint(String lowercase, List<String> hints) =>
     hints.any((hint) => lowercase.contains(hint.toLowerCase()));
 
+/// 解析结果里的“商家：麦当劳”“收款方：李四”这类标签只是说明文字，
+/// 匹配分类关键词时要先去掉，否则“家”会命中“商家”，把所有付款都算成家庭。
+final _autoCaptureLabelPattern = RegExp(
+  r'(商家|店铺|收款方|收款人|付款人|付款方|对方|对象|场景|备注)[:：]',
+);
+
+String _autoCaptureMatchText(AutoCaptureRecord capture) => [
+  capture.title,
+  capture.merchant,
+  capture.counterpartyName,
+  capture.detailSummary.replaceAll(_autoCaptureLabelPattern, ' '),
+  capture.rawBody,
+  capture.scenario,
+  capture.source.label,
+  ...capture.relatedSources.map((item) => item.label),
+].join(' ').toLowerCase();
+
 (String, List<String>) inferAutoCaptureCategoryId({
   required LedgerBook book,
   required AutoCaptureRecord capture,
 }) {
-  final combined = [
-    capture.title,
-    capture.merchant,
-    capture.counterpartyName,
-    capture.detailSummary,
-    capture.rawBody,
-    capture.scenario,
-    capture.source.label,
-    ...capture.relatedSources.map((item) => item.label),
-  ].join(' ');
-  final lowercase = combined.toLowerCase();
+  final lowercase = _autoCaptureMatchText(capture);
   for (final rule in book.customRules) {
     if (rule.pattern.isNotEmpty &&
         lowercase.contains(rule.pattern.toLowerCase())) {
@@ -4885,6 +5644,8 @@ class _CashFlowChartCard extends StatelessWidget {
             height: 240,
             child: RepaintBoundary(
               child: BarChart(
+                duration: const Duration(milliseconds: 620),
+                curve: Curves.easeOutCubic,
                 BarChartData(
                   maxY: chartMax,
                   alignment: BarChartAlignment.spaceAround,
@@ -5345,7 +6106,9 @@ class _GlassCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return _AnimatedReveal(
-      child: Container(
+      // 每张卡都带模糊阴影，加一层重绘边界后滚动时不用反复重新栅格化。
+      child: RepaintBoundary(
+        child: Container(
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topLeft,
@@ -5373,6 +6136,7 @@ class _GlassCard extends StatelessWidget {
         ),
         padding: const EdgeInsets.all(18),
         child: child,
+        ),
       ),
     );
   }
@@ -5939,6 +6703,31 @@ class _VaultUnlockScreenState extends ConsumerState<_VaultUnlockScreen> {
   }
 }
 
+/// 金额滚动：数字变化时从旧值滑到新值，一次性动画，不循环。
+class _RollingAmountText extends StatelessWidget {
+  const _RollingAmountText({
+    required this.value,
+    required this.fallbackText,
+    required this.formatter,
+    required this.style,
+  });
+
+  final double value;
+  final String fallbackText;
+  final String Function(double value) formatter;
+  final TextStyle style;
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween<double>(begin: 0, end: value),
+      duration: const Duration(milliseconds: 720),
+      curve: Curves.easeOutCubic,
+      builder: (context, animated, _) => Text(formatter(animated), style: style),
+    );
+  }
+}
+
 class _HeroLedgerCard extends StatelessWidget {
   const _HeroLedgerCard({
     required this.title,
@@ -5946,6 +6735,9 @@ class _HeroLedgerCard extends StatelessWidget {
     required this.amountText,
     required this.chips,
     required this.trailing,
+    this.amountValue,
+    this.amountFormatter,
+    this.animateAmount = false,
   });
 
   final String title;
@@ -5953,6 +6745,11 @@ class _HeroLedgerCard extends StatelessWidget {
   final String amountText;
   final List<_HeroChipAction> chips;
   final Widget trailing;
+
+  /// 金额的数值形式；给了就在数字变化时做滚动动画。
+  final double? amountValue;
+  final String Function(double value)? amountFormatter;
+  final bool animateAmount;
 
   @override
   Widget build(BuildContext context) {
@@ -5983,14 +6780,28 @@ class _HeroLedgerCard extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 4),
-                    Text(
-                      amountText,
-                      style: GoogleFonts.spaceGrotesk(
-                        fontSize: 34,
-                        fontWeight: FontWeight.w700,
-                        color: Colors.white,
+                    if (animateAmount &&
+                        amountValue != null &&
+                        amountFormatter != null)
+                      _RollingAmountText(
+                        value: amountValue!,
+                        fallbackText: amountText,
+                        formatter: amountFormatter!,
+                        style: GoogleFonts.spaceGrotesk(
+                          fontSize: 34,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
+                      )
+                    else
+                      Text(
+                        amountText,
+                        style: GoogleFonts.spaceGrotesk(
+                          fontSize: 34,
+                          fontWeight: FontWeight.w700,
+                          color: Colors.white,
+                        ),
                       ),
-                    ),
                     const SizedBox(height: 6),
                     Text(
                       subtitle,
@@ -6679,6 +7490,14 @@ class DashboardScreen extends ConsumerWidget {
                   title: '本月净结余',
                   subtitle: '自动记账与手动记账实时汇总',
                   amountText: monthBalanceLabel(book, viewState),
+                  // 打码时不滚动，避免把隐藏的金额用动画"漏"出来。
+                  amountValue:
+                      monthIncomeTotal(book, DateTime.now()) -
+                      monthExpenseTotal(book, DateTime.now()),
+                  amountFormatter: (value) =>
+                      formatAmount(value, viewState, signed: true),
+                  animateAmount:
+                      !book.settings.maskAmounts || viewState.revealAmounts,
                   chips: [
                     _HeroChipAction(
                       label: '收入 ${formatAmount(monthIncome, viewState)}',
@@ -8157,7 +8976,7 @@ class InsightsScreen extends StatelessWidget {
                 children: [
                   Expanded(
                     child: Text(
-                      '把钱放回生活语境里看',
+                      '看看钱都花到哪儿了',
                       style: GoogleFonts.spaceGrotesk(
                         fontSize: 28,
                         fontWeight: FontWeight.w700,
@@ -8191,7 +9010,7 @@ class InsightsScreen extends StatelessWidget {
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
-                        '这里导出的是本地统计文件，会先让你选择文件夹，再保存分类统计 CSV、流水明细 CSV 和只读账本快照 JSON。',
+                        '导出会在手机本地生成统计文件：分类统计表、流水明细表和账本快照。导出前会让你选保存位置。',
                         style: GoogleFonts.plusJakartaSans(
                           color: const Color(0xFF60708A),
                           height: 1.5,
@@ -8202,13 +9021,17 @@ class InsightsScreen extends StatelessWidget {
                 ),
               ),
               Text(
-                '洞察页会把支出结构、生活覆盖和固定压力放到一起，帮助你决定下一步怎么调。',
+                '这里把支出结构、各类开销和固定扣款放在一起，方便你看清下一步怎么调整。',
                 style: GoogleFonts.plusJakartaSans(
                   color: const Color(0xFF60708A),
                 ),
               ),
               const SizedBox(height: 18),
-              LocalAiCard(book: book),
+              const LocalAiChatEntry(),
+              const SizedBox(height: 12),
+              const LocalAiVoiceAskEntry(),
+              const SizedBox(height: 18),
+              LedgerAnomalyCard(book: book),
               const SizedBox(height: 18),
               MoodConsumptionChartCard(book: book),
               const SizedBox(height: 18),
@@ -8219,6 +9042,8 @@ class InsightsScreen extends StatelessWidget {
                       ? const Center(child: Text('暂无足够的支出数据绘制结构图。'))
                       : RepaintBoundary(
                           child: PieChart(
+                            duration: const Duration(milliseconds: 620),
+                            curve: Curves.easeOutCubic,
                             PieChartData(
                               sectionsSpace: 4,
                               centerSpaceRadius: 56,
@@ -8242,7 +9067,7 @@ class InsightsScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 22),
-              _SectionHeader(title: '关键判断', actionLabel: '', onTap: null),
+              _SectionHeader(title: '要点提醒', actionLabel: '', onTap: null),
               const SizedBox(height: 12),
               for (final insight in insights)
                 Padding(
@@ -8250,7 +9075,7 @@ class InsightsScreen extends StatelessWidget {
                   child: _InsightBulletCard(text: insight),
                 ),
               const SizedBox(height: 22),
-              _SectionHeader(title: '生活维度热力表', actionLabel: '', onTap: null),
+              _SectionHeader(title: '各类开销一览', actionLabel: '', onTap: null),
               const SizedBox(height: 12),
               for (final pillar in pillarData)
                 Padding(
@@ -8287,7 +9112,7 @@ class InsightsScreen extends StatelessWidget {
                     ),
                   ),
                   subtitle: Text(
-                    '查看你的钱都花在了哪里',
+                    '看看每一笔花在哪儿了',
                     style: GoogleFonts.plusJakartaSans(
                       color: const Color(0xFF60708A),
                     ),
@@ -8304,7 +9129,7 @@ class InsightsScreen extends StatelessWidget {
               ),
               const SizedBox(height: 22),
               // --- Region Spend Analysis ---
-              _SectionHeader(title: '区域消费分布', actionLabel: '', onTap: null),
+              _SectionHeader(title: '常去的地方花了多少', actionLabel: '', onTap: null),
               const SizedBox(height: 12),
               Builder(
                 builder: (context) {
@@ -8315,7 +9140,7 @@ class InsightsScreen extends StatelessWidget {
                         child: Padding(
                           padding: const EdgeInsets.all(20),
                           child: Text(
-                            '暂无位置数据，开启位置记账后这里会展示各区域消费占比。',
+                            '还没有位置记录。打开位置记账后，这里会显示各地的消费占比。',
                             textAlign: TextAlign.center,
                             style: GoogleFonts.plusJakartaSans(
                               color: const Color(0xFF60708A),
@@ -8341,6 +9166,8 @@ class InsightsScreen extends StatelessWidget {
                           height: 180,
                           child: RepaintBoundary(
                             child: PieChart(
+                              duration: const Duration(milliseconds: 620),
+                              curve: Curves.easeOutCubic,
                               PieChartData(
                                 sectionsSpace: 3,
                                 centerSpaceRadius: 40,
@@ -8449,7 +9276,7 @@ class VaultScreen extends ConsumerWidget {
           sliver: SliverList.list(
             children: [
               Text(
-                '机密模式和自动记账控制台',
+                '隐私与自动记账',
                 style: GoogleFonts.spaceGrotesk(
                   fontSize: 28,
                   fontWeight: FontWeight.w700,
@@ -8457,15 +9284,15 @@ class VaultScreen extends ConsumerWidget {
               ),
               const SizedBox(height: 12),
               Text(
-                '这里负责加密落盘、后台快速锁定，以及微信 / 支付宝 / Google Pay 自动记账接入。',
+                '这里管理加密保存、后台自动锁定，以及微信、支付宝等支付通知的自动记账。',
                 style: GoogleFonts.plusJakartaSans(
                   color: const Color(0xFF60708A),
                 ),
               ),
               const SizedBox(height: 18),
               _HeroLedgerCard(
-                title: '加密保险库',
-                subtitle: 'Android 侧使用标准 AES-GCM 加密账本全文',
+                title: '加密保存',
+                subtitle: '账单在手机上加密后再存盘',
                 amountText: book.settings.confidentialModeEnabled
                     ? '机密模式已开'
                     : '标准加密模式',
@@ -8486,6 +9313,10 @@ class VaultScreen extends ConsumerWidget {
                   icon: const Icon(Icons.lock),
                 ),
               ),
+              const SizedBox(height: 18),
+              LocalAiModelSettingsEntry(book: book),
+              const SizedBox(height: 12),
+              AutoCapturePipelineCard(book: book),
               const SizedBox(height: 18),
               _GlassCard(
                 child: Column(
@@ -8561,8 +9392,8 @@ class VaultScreen extends ConsumerWidget {
                     DropdownButtonFormField<String>(
                       value: resolveDefaultExpenseCategoryId(book.settings),
                       decoration: const InputDecoration(
-                        labelText: '自动记账兜底类别',
-                        helperText: '会先分析付款人名字、商户、平台和通知内容；只有判断不出来时才回退到这里。',
+                        labelText: '自动记账默认分类',
+                        helperText: '分类由千问生成；这里只是千问没能给出结果时的备用分类。',
                       ),
                       items: [
                         for (final category in categoriesForType(
@@ -8695,14 +9526,14 @@ class VaultScreen extends ConsumerWidget {
               ),
 
               const SizedBox(height: 22),
-              _SectionHeader(title: '空间与资产自动化', actionLabel: '', onTap: null),
+              _SectionHeader(title: '位置与常用地点', actionLabel: '', onTap: null),
               const SizedBox(height: 12),
               _GlassCard(
                 child: Column(
                   children: [
                     DropdownButtonFormField<LocationTrackingMode>(
                       value: book.settings.locationMode,
-                      decoration: const InputDecoration(labelText: '位置记账助手模式'),
+                      decoration: const InputDecoration(labelText: '记录位置的方式'),
                       items: const [
                         DropdownMenuItem(
                           value: LocationTrackingMode.off,
@@ -8710,15 +9541,15 @@ class VaultScreen extends ConsumerWidget {
                         ),
                         DropdownMenuItem(
                           value: LocationTrackingMode.foregroundLazy,
-                          child: Text('前台懒加载模式 (推荐)'),
+                          child: Text('用当前定位（推荐）'),
                         ),
                         DropdownMenuItem(
                           value: LocationTrackingMode.ipRough,
-                          child: Text('网络 IP 粗略定位'),
+                          child: Text('只记网络大致位置（不精确）'),
                         ),
                         DropdownMenuItem(
                           value: LocationTrackingMode.backgroundPrecise,
-                          child: Text('后台精确定位 (可能耗电)'),
+                          child: Text('每次重新定位（会慢一点）'),
                         ),
                       ],
                       onChanged: (value) {
@@ -8743,7 +9574,7 @@ class VaultScreen extends ConsumerWidget {
                         ),
                       ),
                       title: const Text('自动记账记录位置'),
-                      subtitle: const Text('自动记账时同步获取当前位置'),
+                      subtitle: const Text('自动记账时顺便记下当前位置'),
                       value: book.settings.autoRecordLocation,
                       onChanged: (value) {
                         controller.updateSettings(
