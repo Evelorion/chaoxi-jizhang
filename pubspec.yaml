@@ -48,6 +48,7 @@ dependencies:
   latlong2: ^0.9.1
   llama_flutter_android: 0.2.6
   crypto: 3.0.6
+  speech_to_text: ^7.4.0
 
 dev_dependencies:
   flutter_test:
