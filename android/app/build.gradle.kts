@@ -30,7 +30,7 @@ android {
 
     defaultConfig {
         applicationId = "com.aline.jier.jier"
-        minSdk = flutter.minSdkVersion
+        minSdk = 26 // llama_flutter_android requires Android 8.0 or newer.
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

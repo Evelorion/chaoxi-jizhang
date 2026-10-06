@@ -24,11 +24,24 @@ object AutoCaptureStore {
         upsert(context, capture)
     }
 
-    fun drain(context: Context): List<LedgerCapture> {
+    fun peek(context: Context): List<LedgerCapture> {
+        synchronized(this) {
+            return readQueue(context)
+        }
+    }
+
+    fun acknowledge(context: Context, records: List<Map<String, Any?>>) {
         synchronized(this) {
             val queue = readQueue(context)
-            saveQueue(context, emptyList())
-            return queue
+            val remaining = queue.filterNot { current ->
+                records.any { snapshot ->
+                    snapshot["id"] == current.id &&
+                        snapshot["rawBody"] == current.rawBody &&
+                        snapshot["detailSummary"] == current.detailSummary &&
+                        (snapshot["amount"] as? Number)?.toDouble() == current.amount
+                }
+            }
+            if (remaining.size != queue.size) saveQueue(context, remaining)
         }
     }
 

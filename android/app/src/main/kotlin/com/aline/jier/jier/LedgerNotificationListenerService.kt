@@ -73,7 +73,7 @@ class LedgerNotificationListenerService : NotificationListenerService() {
         if (potentialPayment) {
             Log.d(
                 "JierAutoCapture",
-                "dispatch package=${sbn.packageName} profile=$profileId title=$title titleBig=$titleBig conversation=$conversationTitle",
+                "dispatch package=${sbn.packageName} profile=$profileId",
             )
         }
 
@@ -93,7 +93,7 @@ class LedgerNotificationListenerService : NotificationListenerService() {
             if (potentialPayment) {
                 Log.d(
                     "JierAutoCapture",
-                    "skipped package=${sbn.packageName} profile=$profileId title=$title titleBig=$titleBig conversation=$conversationTitle subText=$subText summary=$summaryText body=$body"
+                    "skipped package=${sbn.packageName} profile=$profileId"
                 )
             }
             return
@@ -116,7 +116,7 @@ class LedgerNotificationListenerService : NotificationListenerService() {
             NotificationCorrelationStore.upsertRecentCapture(applicationContext, capture)
             Log.d(
                 "JierAutoCapture",
-                "captured source=${capture.source} related=${capture.relatedSources.joinToString()} profile=${capture.profileId} amount=${capture.amount} merchant=${capture.merchant} counterparty=${capture.counterpartyName}",
+                "captured source=${capture.source} profile=${capture.profileId}",
             )
             return
         }
@@ -127,7 +127,7 @@ class LedgerNotificationListenerService : NotificationListenerService() {
             NotificationCorrelationStore.upsertRecentCapture(applicationContext, updatedCapture)
             Log.d(
                 "JierAutoCapture",
-                "enriched source=${event.source} profile=${event.profileId} mergeKey=${event.mergeKey} captureId=${updatedCapture.id}",
+                "enriched source=${event.source} profile=${event.profileId}",
             )
             return
         }
@@ -135,7 +135,7 @@ class LedgerNotificationListenerService : NotificationListenerService() {
         NotificationCorrelationStore.enqueuePendingEvent(applicationContext, event)
         Log.d(
             "JierAutoCapture",
-            "pending source=${event.source} profile=${event.profileId} kind=${event.eventKind} mergeKey=${event.mergeKey} merchant=${event.merchant} counterparty=${event.counterpartyName}",
+            "pending source=${event.source} profile=${event.profileId} kind=${event.eventKind}",
         )
     }
 

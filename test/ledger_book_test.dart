@@ -248,13 +248,144 @@ void main() {
       );
 
       expect(
-        inferAutoCaptureCategoryId(book: book, capture: familyCapture),
+        inferAutoCaptureCategoryId(book: book, capture: familyCapture).$1,
         'family',
       );
       expect(
-        inferAutoCaptureCategoryId(book: book, capture: shoppingCapture),
+        inferAutoCaptureCategoryId(book: book, capture: shoppingCapture).$1,
         'shopping',
       );
     },
   );
+
+  test('local AI uses only current month and never includes private notes', () {
+    final current = LedgerEntry(
+      id: 'current',
+      title: '午餐\n外卖',
+      merchant: '小店',
+      note: '私人备注不应进入 AI 提示词',
+      amount: 28,
+      type: EntryType.expense,
+      categoryId: 'food',
+      channel: PaymentChannel.wechatPay,
+      occurredAt: DateTime(2026, 10, 2),
+      autoCaptured: false,
+      sourceLabel: '',
+    );
+    final old = current.copyWith(
+      id: 'old',
+      title: '旧账',
+      amount: 9999,
+      occurredAt: DateTime(2026, 9, 2),
+    );
+    final book = LedgerBook.empty(false).copyWith(entries: [old, current]);
+    final prompt = buildLocalAiPrompt(book, now: DateTime(2026, 10, 6));
+    expect(prompt, contains('支出28.00元'));
+    expect(prompt, contains('午餐 外卖'));
+    expect(prompt, isNot(contains('私人备注')));
+    expect(prompt, isNot(contains('9999')));
+  });
+
+  test(
+    'local AI category output is limited to valid category and entry type',
+    () {
+      AutoCaptureRecord capture(String id, EntryType type) => AutoCaptureRecord(
+        id: id,
+        title: '支付',
+        merchant: '小店',
+        rawBody: '支付成功',
+        scenario: 'merchantPayment',
+        detailSummary: '',
+        amount: 10,
+        entryType: type,
+        channel: PaymentChannel.wechatPay,
+        source: CaptureSource.wechat,
+        capturedAt: DateTime(2026, 10, 6),
+        postedAtMillis: DateTime(2026, 10, 6).millisecondsSinceEpoch,
+        confidence: 0.9,
+        defaultCategoryId: 'daily',
+        profileId: 0,
+        mergeKey: 'key',
+        relatedSources: const [],
+      );
+      final batch = [
+        capture('expense', EntryType.expense),
+        capture('income', EntryType.income),
+      ];
+      final parsed = parseLocalAiCategories(
+        '结果：{"0":"food","1":"shopping"}',
+        batch,
+      );
+      expect(parsed, {'expense': 'food'});
+      expect(parseLocalAiCategories('不是 JSON', batch), isEmpty);
+    },
+  );
+
+  test('local AI preference survives vault settings serialization', () {
+    final settings = LedgerBook.empty(false).settings.copyWith(
+      localAiModelId: 'qwen3-17b-q4',
+      autoAiCaptureEnabled: true,
+    );
+    final restored = VaultSettings.fromJson(settings.toJson());
+    expect(restored.localAiModelId, 'qwen3-17b-q4');
+    expect(restored.autoAiCaptureEnabled, isTrue);
+  });
+
+  test('local AI question retrieves merchant history across months', () {
+    LedgerEntry entry(
+      String id,
+      String merchant,
+      DateTime date,
+      double amount,
+    ) => LedgerEntry(
+      id: id,
+      title: '咖啡',
+      merchant: merchant,
+      note: '不可展示的私人备注',
+      amount: amount,
+      type: EntryType.expense,
+      categoryId: 'food',
+      channel: PaymentChannel.wechatPay,
+      occurredAt: date,
+      autoCaptured: false,
+      sourceLabel: '',
+    );
+    final book = LedgerBook.empty(false).copyWith(
+      entries: [
+        entry('old', '瑞幸', DateTime(2026, 9, 12), 22),
+        entry('new', '瑞幸', DateTime(2026, 10, 3), 25),
+        entry('other', '别的店', DateTime(2026, 10, 4), 99),
+      ],
+    );
+    final history = buildLocalAiQuestionPrompt(
+      book,
+      '上次在瑞幸消费是什么时候？',
+      now: DateTime(2026, 10, 6),
+    );
+    expect(history, contains('2026-10-03'));
+    expect(history, contains('2026-09-12'));
+    expect(history, isNot(contains('99.00元')));
+    expect(history, isNot(contains('私人备注')));
+    final monthly = buildLocalAiQuestionPrompt(
+      book,
+      '这个月在瑞幸花了多少？',
+      now: DateTime(2026, 10, 6),
+    );
+    expect(monthly, contains('支出25.00元'));
+    expect(monthly, isNot(contains('2026-09-12')));
+    final september = buildLocalAiQuestionPrompt(
+      book,
+      '9月买了什么？',
+      now: DateTime(2026, 10, 6),
+    );
+    expect(september, contains('2026-09-12'));
+    expect(september, isNot(contains('2026-10-03')));
+    final yesterday = buildLocalAiQuestionPrompt(
+      book,
+      '昨天消费了什么？',
+      now: DateTime(2026, 10, 4),
+    );
+    expect(yesterday, contains('2026-10-03'));
+    expect(yesterday, isNot(contains('2026-09-12')));
+  });
 }
