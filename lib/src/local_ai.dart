@@ -56,10 +56,14 @@ Future<String> _localAiModelPath(LocalAiModel model) async {
 }
 
 Future<bool> _isInstalled(LocalAiModel model) async {
-  final path = await _localAiModelPath(model);
-  final marker = File('$path.verified');
-  if (!await File(path).exists() || !await marker.exists()) return false;
-  return (await marker.readAsString()).trim() == model.sha256;
+  try {
+    final path = await _localAiModelPath(model);
+    final marker = File('$path.verified');
+    if (!await File(path).exists() || !await marker.exists()) return false;
+    return (await marker.readAsString()).trim() == model.sha256;
+  } on FileSystemException {
+    return false;
+  }
 }
 
 Future<String> _hashLocalAiFile(String path) async =>
@@ -77,6 +81,7 @@ class _LocalAiDownloader {
   Future<void> download(
     LocalAiModel model,
     void Function(int received, int total) onProgress,
+    VoidCallback onVerifying,
   ) async {
     final path = await _localAiModelPath(model);
     final partial = File('$path.partial');
@@ -133,7 +138,9 @@ class _LocalAiDownloader {
         throw const FormatException('模型下载不完整，可再次点击继续下载');
       }
       onProgress(received, received);
+      onVerifying();
       final digest = await Isolate.run(() => _hashLocalAiFile(partial.path));
+      if (_cancelled) throw const _LocalAiCancelled();
       if (digest != model.sha256) {
         await partial.delete();
         throw const FormatException('模型校验失败，已删除损坏文件');
@@ -252,8 +259,9 @@ String buildLocalAiQuestionPrompt(
       final target = anchor.subtract(Duration(days: relativeDay));
       if (date.year != target.year ||
           date.month != target.month ||
-          date.day != target.day)
+          date.day != target.day) {
         return false;
+      }
     }
     if (keyword.isEmpty) return true;
     final text =
@@ -408,10 +416,13 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
   LocalAiModel _selected = LocalAiModel.available.first;
   final TextEditingController _questionController = TextEditingController();
   final Set<String> _installed = {};
+  final Set<String> _partialModels = {};
   _LocalAiDownloader? _downloader;
   LlamaController? _llama;
   bool _busy = false;
   bool _downloading = false;
+  bool _verifying = false;
+  bool _loadingModel = false;
   int _received = 0;
   int _total = 0;
   String _answer = '';
@@ -429,9 +440,11 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
     _refreshInstalled();
   }
 
-  Future<void> _saveAiSettings({String? modelId, bool? autoCapture}) async {
+  Future<bool> _saveAiSettings({String? modelId, bool? autoCapture}) async {
     final book = ref.read(ledgerControllerProvider).book;
-    if (book == null) return;
+    if (book == null) return false;
+    final effectiveAutoCapture =
+        modelId != null && !_installed.contains(modelId) ? false : autoCapture;
     setState(() => _busy = true);
     try {
       await ref
@@ -439,9 +452,28 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
           .updateSettings(
             book.settings.copyWith(
               localAiModelId: modelId,
-              autoAiCaptureEnabled: autoCapture,
+              autoAiCaptureEnabled: effectiveAutoCapture,
             ),
           );
+      final saved = ref.read(ledgerControllerProvider).book?.settings;
+      final success =
+          saved != null &&
+          (modelId == null || saved.localAiModelId == modelId) &&
+          (effectiveAutoCapture == null ||
+              saved.autoAiCaptureEnabled == effectiveAutoCapture);
+      if (!success && mounted) {
+        setState(() {
+          _error = '设置保存失败，请重试。';
+          _selected = LocalAiModel.available.firstWhere(
+            (model) => model.id == saved?.localAiModelId,
+            orElse: () => LocalAiModel.available.first,
+          );
+        });
+      }
+      return success;
+    } catch (e) {
+      if (mounted) setState(() => _error = '设置保存失败：$e');
+      return false;
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -449,14 +481,20 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
 
   Future<void> _refreshInstalled() async {
     final installed = <String>{};
+    final partialModels = <String>{};
     for (final model in LocalAiModel.available) {
       if (await _isInstalled(model)) installed.add(model.id);
+      final path = await _localAiModelPath(model);
+      if (await File('$path.partial').exists()) partialModels.add(model.id);
     }
     if (mounted) {
       setState(() {
         _installed
           ..clear()
           ..addAll(installed);
+        _partialModels
+          ..clear()
+          ..addAll(partialModels);
       });
     }
   }
@@ -478,31 +516,50 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
     setState(() {
       _busy = true;
       _downloading = true;
+      _verifying = false;
       _error = null;
       _received = 0;
       _total = 0;
     });
     try {
-      await downloader.download(_selected, (received, total) {
-        if (!mounted) return;
-        if (received - _received > 1024 * 1024 || received == total) {
-          setState(() {
-            _received = received;
-            _total = total;
-          });
-        }
-      });
-      if (mounted) setState(() => _installed.add(_selected.id));
+      await downloader.download(
+        _selected,
+        (received, total) {
+          if (!mounted) return;
+          if (received - _received > 1024 * 1024 || received == total) {
+            setState(() {
+              _received = received;
+              _total = total;
+            });
+          }
+        },
+        () {
+          if (mounted) setState(() => _verifying = true);
+        },
+      );
+      if (mounted) {
+        HapticFeedback.lightImpact();
+        setState(() {
+          _installed.add(_selected.id);
+          _partialModels.remove(_selected.id);
+        });
+      }
     } on _LocalAiCancelled {
       // Keep the partial file for a later resume.
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     } finally {
       _downloader = null;
+      try {
+        await _refreshInstalled();
+      } catch (e) {
+        if (mounted) setState(() => _error ??= '读取模型状态失败：$e');
+      }
       if (mounted) {
         setState(() {
           _busy = false;
           _downloading = false;
+          _verifying = false;
         });
       }
     }
@@ -510,8 +567,12 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
 
   Future<void> _delete() async {
     if (_busy) return;
+    if (_localAiEngineBusy) {
+      setState(() => _error = '千问正在处理通知，请稍后删除模型。');
+      return;
+    }
     if (widget.book.settings.autoAiCaptureEnabled) {
-      await _saveAiSettings(autoCapture: false);
+      if (!await _saveAiSettings(autoCapture: false)) return;
     }
     final path = await _localAiModelPath(_selected);
     for (final suffix in ['', '.verified', '.partial']) {
@@ -521,6 +582,7 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
     if (mounted) {
       setState(() {
         _installed.remove(_selected.id);
+        _partialModels.remove(_selected.id);
         _answer = '';
       });
     }
@@ -528,6 +590,16 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
 
   Future<void> _generate([String? question]) async {
     if (_busy || !_installed.contains(_selected.id)) return;
+    final prompt = question == null
+        ? buildLocalAiPrompt(widget.book)
+        : buildLocalAiQuestionPrompt(widget.book, question);
+    if (question != null && prompt.contains('符合时间和关键词的流水共0笔')) {
+      setState(() {
+        _error = null;
+        _answer = '没有找到符合条件的流水。';
+      });
+      return;
+    }
     if (_localAiEngineBusy) {
       setState(() => _error = '千问正在处理通知，请稍后重试。');
       return;
@@ -538,17 +610,11 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
       _error = null;
       _answer = '';
       _pendingAnswer = '';
+      _loadingModel = true;
     });
     final llama = LlamaController();
     _llama = llama;
     try {
-      final prompt = question == null
-          ? buildLocalAiPrompt(widget.book)
-          : buildLocalAiQuestionPrompt(widget.book, question);
-      if (question != null && prompt.contains('符合时间和关键词的流水共0笔')) {
-        if (mounted) setState(() => _answer = '没有找到符合条件的流水。');
-        return;
-      }
       final path = await _localAiModelPath(_selected);
       final marker = await File('$path.verified').readAsString();
       if (marker.trim() != _selected.sha256 || !await File(path).exists()) {
@@ -561,6 +627,7 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
         gpuLayers: 0,
       );
       if (!mounted) return;
+      setState(() => _loadingModel = false);
       await for (final token in llama.generateChat(
         messages: [
           ChatMessage(
@@ -597,7 +664,12 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
       } finally {
         _llama = null;
         _localAiEngineBusy = false;
-        if (mounted) setState(() => _busy = false);
+        if (mounted) {
+          setState(() {
+            _busy = false;
+            _loadingModel = false;
+          });
+        }
       }
     }
   }
@@ -647,28 +719,43 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
             ),
           const SizedBox(height: 12),
           for (final model in LocalAiModel.available)
-            ListTile(
-              dense: true,
-              contentPadding: EdgeInsets.zero,
-              leading: Icon(
-                _selected.id == model.id
-                    ? Icons.radio_button_checked
-                    : Icons.radio_button_unchecked,
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 180),
+              curve: Curves.easeOutCubic,
+              margin: const EdgeInsets.only(bottom: 4),
+              decoration: BoxDecoration(
+                color: _selected.id == model.id
+                    ? const Color(0xFFEAF1FF)
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(16),
               ),
-              title: Text(model.name),
-              subtitle: Text(
-                '${model.sizeLabel} · ${model.description}${_installed.contains(model.id) ? ' · 已下载' : ''}',
+              child: Semantics(
+                selected: _selected.id == model.id,
+                child: ListTile(
+                  dense: true,
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 8),
+                  leading: Icon(
+                    _selected.id == model.id
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_unchecked,
+                  ),
+                  title: Text(model.name),
+                  subtitle: Text(
+                    '${model.sizeLabel} · ${model.description}${_installed.contains(model.id) ? ' · 已下载' : ''}',
+                  ),
+                  onTap: _busy
+                      ? null
+                      : () {
+                          if (_selected.id == model.id) return;
+                          setState(() {
+                            _selected = model;
+                            _error = null;
+                            _answer = '';
+                          });
+                          _saveAiSettings(modelId: model.id);
+                        },
+                ),
               ),
-              onTap: _busy
-                  ? null
-                  : () {
-                      setState(() {
-                        _selected = model;
-                        _error = null;
-                        _answer = '';
-                      });
-                      _saveAiSettings(modelId: model.id);
-                    },
             ),
           SwitchListTile.adaptive(
             contentPadding: EdgeInsets.zero,
@@ -682,17 +769,60 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
                 ? null
                 : (value) => _saveAiSettings(autoCapture: value),
           ),
-          if (_downloading) ...[
-            LinearProgressIndicator(
-              value: _total > 0 ? _received / _total : null,
+          AnimatedSize(
+            duration: const Duration(milliseconds: 220),
+            curve: Curves.easeOutCubic,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              child: !_downloading
+                  ? const SizedBox.shrink(key: ValueKey('ai-download-idle'))
+                  : _verifying
+                  ? const Padding(
+                      key: ValueKey('ai-download-verifying'),
+                      padding: EdgeInsets.only(top: 12),
+                      child: Row(
+                        children: [
+                          SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                          SizedBox(width: 10),
+                          Expanded(child: Text('下载完成，正在校验模型文件…')),
+                        ],
+                      ),
+                    )
+                  : Padding(
+                      key: const ValueKey('ai-download-progress'),
+                      padding: const EdgeInsets.only(top: 12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          TweenAnimationBuilder<double>(
+                            tween: Tween<double>(
+                              begin: 0,
+                              end: _total > 0
+                                  ? (_received / _total).clamp(0.0, 1.0)
+                                  : 0,
+                            ),
+                            duration: const Duration(milliseconds: 220),
+                            builder: (context, progress, _) =>
+                                LinearProgressIndicator(
+                                  value: _total > 0 ? progress : null,
+                                  semanticsLabel: '模型下载进度',
+                                ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            _total > 0
+                                ? '已下载 ${(_received / 1000000).toStringAsFixed(0)} / ${(_total / 1000000).toStringAsFixed(0)} MB'
+                                : '正在连接模型下载源…',
+                          ),
+                        ],
+                      ),
+                    ),
             ),
-            const SizedBox(height: 6),
-            Text(
-              _total > 0
-                  ? '已下载 ${(_received / 1000000).toStringAsFixed(0)} / ${(_total / 1000000).toStringAsFixed(0)} MB'
-                  : '正在下载…',
-            ),
-          ],
+          ),
           const SizedBox(height: 10),
           Wrap(
             spacing: 8,
@@ -704,9 +834,11 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
                       ? null
                       : _download,
                   icon: const Icon(Icons.download_rounded),
-                  label: const Text('下载模型'),
+                  label: Text(
+                    _partialModels.contains(_selected.id) ? '继续下载' : '下载模型',
+                  ),
                 ),
-              if (_downloading)
+              if (_downloading && !_verifying)
                 OutlinedButton(
                   onPressed: () => _downloader?.cancel(),
                   child: const Text('暂停下载'),
@@ -751,18 +883,37 @@ class _LocalAiCardState extends ConsumerState<LocalAiCard> {
             const SizedBox(height: 10),
             const LinearProgressIndicator(),
             const SizedBox(height: 5),
-            const Text('正在手机本地分析…'),
+            AnimatedSwitcher(
+              duration: const Duration(milliseconds: 180),
+              child: Text(
+                _loadingModel ? '正在加载本地模型…' : '千问正在手机本地整理…',
+                key: ValueKey(_loadingModel),
+              ),
+            ),
           ],
-          if (_error != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 12),
-              child: Text(_error!, style: const TextStyle(color: Colors.red)),
-            ),
-          if (_answer.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 16),
-              child: SelectableText(_answer),
-            ),
+          AnimatedSwitcher(
+            duration: const Duration(milliseconds: 220),
+            switchInCurve: Curves.easeOutCubic,
+            child: _error != null
+                ? Padding(
+                    key: const ValueKey('ai-error'),
+                    padding: const EdgeInsets.only(top: 12),
+                    child: Semantics(
+                      liveRegion: true,
+                      child: Text(
+                        _error!,
+                        style: const TextStyle(color: Colors.red),
+                      ),
+                    ),
+                  )
+                : _answer.isNotEmpty
+                ? Padding(
+                    key: const ValueKey('ai-answer'),
+                    padding: const EdgeInsets.only(top: 16),
+                    child: SelectableText(_answer),
+                  )
+                : const SizedBox.shrink(key: ValueKey('ai-result-empty')),
+          ),
         ],
       ),
     );
