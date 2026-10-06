@@ -74,10 +74,12 @@ class _SpendHeatmapTab extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final geoEntries = book.entries
-        .where((e) =>
-            e.latitude != null &&
-            e.longitude != null &&
-            e.type == EntryType.expense)
+        .where(
+          (e) =>
+              e.latitude != null &&
+              e.longitude != null &&
+              e.type == EntryType.expense,
+        )
         .toList();
 
     if (geoEntries.isEmpty) {
@@ -87,20 +89,27 @@ class _SpendHeatmapTab extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.location_off_rounded,
-                  size: 64, color: const Color(0xFFB0BEC5)),
+              Icon(
+                Icons.location_off_rounded,
+                size: 64,
+                color: const Color(0xFFB0BEC5),
+              ),
               const SizedBox(height: 16),
               Text(
                 '暂无位置数据',
                 style: GoogleFonts.spaceGrotesk(
-                    fontSize: 20, fontWeight: FontWeight.w700),
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
               const SizedBox(height: 8),
               Text(
                 '开启位置记账后，消费记录将自动带上经纬度坐标，这里会展示你的消费地理分布。',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.plusJakartaSans(
-                    color: const Color(0xFF60708A), height: 1.6),
+                  color: const Color(0xFF60708A),
+                  height: 1.6,
+                ),
               ),
             ],
           ),
@@ -126,21 +135,26 @@ class _SpendHeatmapTab extends StatelessWidget {
           color: const Color(0xFFE8EAF6),
           child: Row(
             children: [
-              const Icon(Icons.pin_drop_rounded,
-                  color: Color(0xFF5C6BC0), size: 20),
+              const Icon(
+                Icons.pin_drop_rounded,
+                color: Color(0xFF5C6BC0),
+                size: 20,
+              ),
               const SizedBox(width: 8),
               Text(
                 '${clusters.length} 个消费地点',
                 style: GoogleFonts.plusJakartaSans(
-                    fontWeight: FontWeight.w600,
-                    color: const Color(0xFF3F51B5)),
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xFF3F51B5),
+                ),
               ),
               const Spacer(),
               Text(
                 '总计 ${_safeCurrencyFormatter.format(totalSpend)}',
                 style: GoogleFonts.plusJakartaSans(
-                    fontWeight: FontWeight.w700,
-                    color: const Color(0xFF283593)),
+                  fontWeight: FontWeight.w700,
+                  color: const Color(0xFF283593),
+                ),
               ),
             ],
           ),
@@ -157,8 +171,7 @@ class _SpendHeatmapTab extends StatelessWidget {
             ),
             children: [
               TileLayer(
-                urlTemplate:
-                    'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.chaoxi.ledger',
               ),
               MarkerLayer(
@@ -207,14 +220,19 @@ class _SpendHeatmapTab extends StatelessWidget {
           children: [
             Row(
               children: [
-                const Icon(Icons.location_on,
-                    color: Color(0xFF5C6BC0), size: 24),
+                const Icon(
+                  Icons.location_on,
+                  color: Color(0xFF5C6BC0),
+                  size: 24,
+                ),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
                     cluster.label,
                     style: GoogleFonts.spaceGrotesk(
-                        fontSize: 18, fontWeight: FontWeight.w700),
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                    ),
                   ),
                 ),
               ],
@@ -223,7 +241,8 @@ class _SpendHeatmapTab extends StatelessWidget {
             Text(
               '${cluster.entries.length} 笔消费 · 合计 ${_safeCurrencyFormatter.format(cluster.totalAmount)}',
               style: GoogleFonts.plusJakartaSans(
-                  color: const Color(0xFF60708A)),
+                color: const Color(0xFF60708A),
+              ),
             ),
             const SizedBox(height: 12),
             ConstrainedBox(
@@ -238,15 +257,19 @@ class _SpendHeatmapTab extends StatelessWidget {
                   return ListTile(
                     dense: true,
                     leading: Icon(cat.icon, color: cat.color, size: 20),
-                    title: Text(e.title,
-                        style: const TextStyle(fontWeight: FontWeight.w600)),
+                    title: Text(
+                      e.title,
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
                     subtitle: Text(
-                        DateFormat('MM/dd HH:mm').format(e.occurredAt)),
+                      DateFormat('MM/dd HH:mm').format(e.occurredAt),
+                    ),
                     trailing: Text(
                       _safeCurrencyFormatter.format(e.amount),
                       style: TextStyle(
-                          fontWeight: FontWeight.w700,
-                          color: cat.color),
+                        fontWeight: FontWeight.w700,
+                        color: cat.color,
+                      ),
                     ),
                   );
                 },
@@ -258,7 +281,8 @@ class _SpendHeatmapTab extends StatelessWidget {
                 child: Text(
                   '还有 ${cluster.entries.length - 10} 笔...',
                   style: GoogleFonts.plusJakartaSans(
-                      color: const Color(0xFF7A869C)),
+                    color: const Color(0xFF7A869C),
+                  ),
                 ),
               ),
           ],
@@ -286,15 +310,17 @@ class _SpendHeatmapTab extends StatelessWidget {
         }
       }
       if (!merged) {
-        clusters.add(_SpendCluster(
-          latitude: entry.latitude!,
-          longitude: entry.longitude!,
-          label: entry.locationInfo.isNotEmpty
-              ? entry.locationInfo
-              : entry.merchant,
-          entries: [entry],
-          totalAmount: entry.amount,
-        ));
+        clusters.add(
+          _SpendCluster(
+            latitude: entry.latitude!,
+            longitude: entry.longitude!,
+            label: entry.locationInfo.isNotEmpty
+                ? entry.locationInfo
+                : entry.merchant,
+            entries: [entry],
+            totalAmount: entry.amount,
+          ),
+        );
       }
     }
     clusters.sort((a, b) => b.totalAmount.compareTo(a.totalAmount));
@@ -387,13 +413,16 @@ class _SpendTrajectoryTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final geoEntries = book.entries
-        .where((e) =>
-            e.latitude != null &&
-            e.longitude != null &&
-            e.type == EntryType.expense)
-        .toList()
-      ..sort((a, b) => a.occurredAt.compareTo(b.occurredAt));
+    final geoEntries =
+        book.entries
+            .where(
+              (e) =>
+                  e.latitude != null &&
+                  e.longitude != null &&
+                  e.type == EntryType.expense,
+            )
+            .toList()
+          ..sort((a, b) => a.occurredAt.compareTo(b.occurredAt));
 
     if (geoEntries.isEmpty) {
       return Center(
@@ -402,20 +431,27 @@ class _SpendTrajectoryTab extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.timeline_rounded,
-                  size: 64, color: const Color(0xFFB0BEC5)),
+              Icon(
+                Icons.timeline_rounded,
+                size: 64,
+                color: const Color(0xFFB0BEC5),
+              ),
               const SizedBox(height: 16),
               Text(
                 '暂无轨迹数据',
                 style: GoogleFonts.spaceGrotesk(
-                    fontSize: 20, fontWeight: FontWeight.w700),
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700,
+                ),
               ),
               const SizedBox(height: 8),
               Text(
                 '开启位置记账后，这里会按时间顺序展示你的消费轨迹。',
                 textAlign: TextAlign.center,
                 style: GoogleFonts.plusJakartaSans(
-                    color: const Color(0xFF60708A), height: 1.6),
+                  color: const Color(0xFF60708A),
+                  height: 1.6,
+                ),
               ),
             ],
           ),
@@ -429,8 +465,9 @@ class _SpendTrajectoryTab extends StatelessWidget {
     final centerLon = (lons.reduce(math.min) + lons.reduce(math.max)) / 2;
 
     // Build polyline points
-    final polyPoints =
-        geoEntries.map((e) => LatLng(e.latitude!, e.longitude!)).toList();
+    final polyPoints = geoEntries
+        .map((e) => LatLng(e.latitude!, e.longitude!))
+        .toList();
 
     return FlutterMap(
       options: MapOptions(
@@ -457,7 +494,9 @@ class _SpendTrajectoryTab extends StatelessWidget {
             for (var i = 0; i < geoEntries.length; i++)
               Marker(
                 point: LatLng(
-                    geoEntries[i].latitude!, geoEntries[i].longitude!),
+                  geoEntries[i].latitude!,
+                  geoEntries[i].longitude!,
+                ),
                 width: 36,
                 height: 36,
                 child: _TrajectoryNode(
@@ -495,10 +534,7 @@ class _TrajectoryNode extends StatelessWidget {
           color: isLast ? const Color(0xFFE53935) : cat.color,
           border: Border.all(color: Colors.white, width: 2),
           boxShadow: [
-            BoxShadow(
-              color: cat.color.withValues(alpha: 0.4),
-              blurRadius: 6,
-            ),
+            BoxShadow(color: cat.color.withValues(alpha: 0.4), blurRadius: 6),
           ],
         ),
         child: Center(
@@ -545,8 +581,10 @@ class _TrajectoryNode extends StatelessWidget {
               _detailRow(Icons.store, entry.merchant),
             if (entry.locationInfo.isNotEmpty)
               _detailRow(Icons.location_on, entry.locationInfo),
-            _detailRow(Icons.access_time,
-                DateFormat('yyyy-MM-dd HH:mm').format(entry.occurredAt)),
+            _detailRow(
+              Icons.access_time,
+              DateFormat('yyyy-MM-dd HH:mm').format(entry.occurredAt),
+            ),
             _detailRow(Icons.category, cat.name),
           ],
         ),
@@ -568,9 +606,12 @@ class _TrajectoryNode extends StatelessWidget {
           Icon(icon, size: 16, color: const Color(0xFF7A869C)),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(text,
-                style: GoogleFonts.plusJakartaSans(
-                    color: const Color(0xFF3C4858))),
+            child: Text(
+              text,
+              style: GoogleFonts.plusJakartaSans(
+                color: const Color(0xFF3C4858),
+              ),
+            ),
           ),
         ],
       ),
@@ -583,7 +624,11 @@ class _TrajectoryNode extends StatelessWidget {
 // ─────────────────────────────────────────────────────────
 
 class _RegionSpend {
-  const _RegionSpend({required this.region, required this.amount, required this.count});
+  const _RegionSpend({
+    required this.region,
+    required this.amount,
+    required this.count,
+  });
   final String region;
   final double amount;
   final int count;
@@ -599,10 +644,17 @@ List<_RegionSpend> regionSpendAnalysis(LedgerBook book) {
     final current = regionMap[region] ?? (0.0, 0);
     regionMap[region] = (current.$1 + entry.amount, current.$2 + 1);
   }
-  final result = regionMap.entries
-      .map((e) => _RegionSpend(region: e.key, amount: e.value.$1, count: e.value.$2))
-      .toList()
-    ..sort((a, b) => b.amount.compareTo(a.amount));
+  final result =
+      regionMap.entries
+          .map(
+            (e) => _RegionSpend(
+              region: e.key,
+              amount: e.value.$1,
+              count: e.value.$2,
+            ),
+          )
+          .toList()
+        ..sort((a, b) => b.amount.compareTo(a.amount));
   return result;
 }
 
@@ -616,7 +668,9 @@ String nearbySummaryForLocation(LedgerBook book, String locationInfo) {
   int count = 0;
   for (final entry in book.entries) {
     if (entry.type != EntryType.expense) continue;
-    if (entry.occurredAt.year != now.year || entry.occurredAt.month != now.month) continue;
+    if (entry.occurredAt.year != now.year ||
+        entry.occurredAt.month != now.month)
+      continue;
     if (entry.locationInfo.startsWith(prefix)) {
       total += entry.amount;
       count++;
@@ -644,12 +698,18 @@ class FavoriteLocationsPage extends ConsumerWidget {
     return Scaffold(
       backgroundColor: const Color(0xFFF5FAFF),
       appBar: AppBar(
-        title: Text('常用地点', style: GoogleFonts.spaceGrotesk(fontWeight: FontWeight.w700)),
+        title: Text(
+          '常用地点',
+          style: GoogleFonts.spaceGrotesk(fontWeight: FontWeight.w700),
+        ),
         backgroundColor: Colors.transparent,
         elevation: 0,
         actions: [
           IconButton(
-            icon: const Icon(Icons.add_location_alt_rounded, color: Color(0xFF5C6BC0)),
+            icon: const Icon(
+              Icons.add_location_alt_rounded,
+              color: Color(0xFF5C6BC0),
+            ),
             tooltip: '添加当前位置',
             onPressed: () => _addCurrentLocation(context, controller),
           ),
@@ -667,20 +727,27 @@ class FavoriteLocationsPage extends ConsumerWidget {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(Icons.bookmark_border_rounded,
-                        size: 64, color: const Color(0xFFB0BEC5)),
+                    Icon(
+                      Icons.bookmark_border_rounded,
+                      size: 64,
+                      color: const Color(0xFFB0BEC5),
+                    ),
                     const SizedBox(height: 16),
                     Text(
                       '还没有收藏地点',
                       style: GoogleFonts.spaceGrotesk(
-                          fontSize: 20, fontWeight: FontWeight.w700),
+                        fontSize: 20,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                     const SizedBox(height: 8),
                     Text(
                       '点击右上角添加你常去的地方（家、公司、超市等），记账时可以快速选择。',
                       textAlign: TextAlign.center,
                       style: GoogleFonts.plusJakartaSans(
-                          color: const Color(0xFF60708A), height: 1.6),
+                        color: const Color(0xFF60708A),
+                        height: 1.6,
+                      ),
                     ),
                   ],
                 ),
@@ -701,45 +768,63 @@ class FavoriteLocationsPage extends ConsumerWidget {
                         color: const Color(0xFFFFF3E0),
                         borderRadius: BorderRadius.circular(10),
                       ),
-                      child: const Icon(Icons.location_on_rounded,
-                          color: Color(0xFFFF7043), size: 22),
+                      child: const Icon(
+                        Icons.location_on_rounded,
+                        color: Color(0xFFFF7043),
+                        size: 22,
+                      ),
                     ),
-                    title: Text(fav.name,
-                        style: const TextStyle(fontWeight: FontWeight.w700)),
+                    title: Text(
+                      fav.name,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
                     subtitle: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(fav.address,
-                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        Text(
+                          fav.address,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
                         if (fav.categoryId != null || fav.defaultTitle != null)
                           Padding(
                             padding: const EdgeInsets.only(top: 4),
                             child: Row(
                               children: [
                                 if (fav.categoryId != null) ...[
-                                  Icon(categoryForId(fav.categoryId!).icon,
-                                      size: 14,
-                                      color:
-                                          categoryForId(fav.categoryId!).color),
+                                  Icon(
+                                    categoryForId(fav.categoryId!).icon,
+                                    size: 14,
+                                    color: categoryForId(fav.categoryId!).color,
+                                  ),
                                   const SizedBox(width: 4),
-                                  Text(categoryForId(fav.categoryId!).name,
-                                      style: TextStyle(
-                                          fontSize: 12,
-                                          color: categoryForId(fav.categoryId!)
-                                              .color)),
+                                  Text(
+                                    categoryForId(fav.categoryId!).name,
+                                    style: TextStyle(
+                                      fontSize: 12,
+                                      color: categoryForId(
+                                        fav.categoryId!,
+                                      ).color,
+                                    ),
+                                  ),
                                   const SizedBox(width: 8),
                                 ],
                                 if (fav.defaultTitle != null)
-                                  Text('📝 ${fav.defaultTitle}',
-                                      style: const TextStyle(
-                                          fontSize: 12,
-                                          color: Color(0xFF7A869C))),
+                                  Text(
+                                    '📝 ${fav.defaultTitle}',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: Color(0xFF7A869C),
+                                    ),
+                                  ),
                                 if (fav.defaultAmount != null)
                                   Text(
-                                      ' · ¥${fav.defaultAmount!.toStringAsFixed(0)}',
-                                      style: const TextStyle(
-                                          fontSize: 12,
-                                          color: Color(0xFF7A869C))),
+                                    ' · ¥${fav.defaultAmount!.toStringAsFixed(0)}',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: Color(0xFF7A869C),
+                                    ),
+                                  ),
                               ],
                             ),
                           ),
@@ -756,12 +841,16 @@ class FavoriteLocationsPage extends ConsumerWidget {
                       itemBuilder: (context) => const [
                         PopupMenuItem(value: 'edit', child: Text('编辑')),
                         PopupMenuItem(
-                            value: 'delete',
-                            child: Text('删除',
-                                style: TextStyle(color: Color(0xFFC44536)))),
+                          value: 'delete',
+                          child: Text(
+                            '删除',
+                            style: TextStyle(color: Color(0xFFC44536)),
+                          ),
+                        ),
                       ],
                     ),
-                    isThreeLine: fav.categoryId != null || fav.defaultTitle != null,
+                    isThreeLine:
+                        fav.categoryId != null || fav.defaultTitle != null,
                   ),
                 );
               },
@@ -770,17 +859,21 @@ class FavoriteLocationsPage extends ConsumerWidget {
   }
 
   Future<void> _addCurrentLocation(
-      BuildContext context, LedgerController controller) async {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('正在获取当前位置...')),
-    );
+    BuildContext context,
+    LedgerController controller,
+  ) async {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('正在获取当前位置...')));
     try {
-      final result = await LocationHelper.getDetailedLocation();
+      final result = await LocationHelper.getDetailedLocation(
+        forceRefresh: true,
+      );
       if (result.isEmpty) {
         if (context.mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('无法获取位置，请检查GPS和权限。')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('无法获取位置，请检查GPS和权限。')));
         }
         return;
       }
@@ -789,14 +882,19 @@ class FavoriteLocationsPage extends ConsumerWidget {
       final name = await showDialog<String>(
         context: context,
         builder: (ctx) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
           title: const Text('给这个地点起个名字'),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text(result.address,
-                  style: GoogleFonts.plusJakartaSans(
-                      color: const Color(0xFF60708A))),
+              Text(
+                result.address,
+                style: GoogleFonts.plusJakartaSans(
+                  color: const Color(0xFF60708A),
+                ),
+              ),
               const SizedBox(height: 12),
               TextField(
                 controller: nameController,
@@ -822,44 +920,52 @@ class FavoriteLocationsPage extends ConsumerWidget {
         ),
       );
       if (name != null && name.isNotEmpty) {
-        await controller.addFavoriteLocation(FavoriteLocation(
-          id: _uuid.v4(),
-          name: name,
-          address: result.address,
-          latitude: result.latitude,
-          longitude: result.longitude,
-        ));
+        await controller.addFavoriteLocation(
+          FavoriteLocation(
+            id: _uuid.v4(),
+            name: name,
+            address: result.address,
+            latitude: result.latitude,
+            longitude: result.longitude,
+          ),
+        );
       }
     } catch (_) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('添加失败，请稍后重试。')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('添加失败，请稍后重试。')));
       }
     }
   }
 
   void _showEditDialog(
-      BuildContext context, LedgerController controller, FavoriteLocation? existing) {
+    BuildContext context,
+    LedgerController controller,
+    FavoriteLocation? existing,
+  ) {
     final isNew = existing == null;
     final nameCtrl = TextEditingController(text: existing?.name ?? '');
     final addressCtrl = TextEditingController(text: existing?.address ?? '');
-    final latCtrl =
-        TextEditingController(text: existing?.latitude.toString() ?? '');
-    final lonCtrl =
-        TextEditingController(text: existing?.longitude.toString() ?? '');
-    final titleCtrl =
-        TextEditingController(text: existing?.defaultTitle ?? '');
+    final latCtrl = TextEditingController(
+      text: existing?.latitude.toString() ?? '',
+    );
+    final lonCtrl = TextEditingController(
+      text: existing?.longitude.toString() ?? '',
+    );
+    final titleCtrl = TextEditingController(text: existing?.defaultTitle ?? '');
     final amountCtrl = TextEditingController(
-        text: existing?.defaultAmount?.toStringAsFixed(2) ?? '');
+      text: existing?.defaultAmount?.toStringAsFixed(2) ?? '',
+    );
     var catId = existing?.categoryId;
 
     showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setState) => AlertDialog(
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
           title: Text(isNew ? '添加常用地点' : '编辑地点'),
           content: SingleChildScrollView(
             child: Column(
@@ -878,27 +984,32 @@ class FavoriteLocationsPage extends ConsumerWidget {
                 Row(
                   children: [
                     Expanded(
-                        child: TextField(
-                      controller: latCtrl,
-                      decoration: const InputDecoration(labelText: '纬度'),
-                      keyboardType: TextInputType.number,
-                    )),
+                      child: TextField(
+                        controller: latCtrl,
+                        decoration: const InputDecoration(labelText: '纬度'),
+                        keyboardType: TextInputType.number,
+                      ),
+                    ),
                     const SizedBox(width: 8),
                     Expanded(
-                        child: TextField(
-                      controller: lonCtrl,
-                      decoration: const InputDecoration(labelText: '经度'),
-                      keyboardType: TextInputType.number,
-                    )),
+                      child: TextField(
+                        controller: lonCtrl,
+                        decoration: const InputDecoration(labelText: '经度'),
+                        keyboardType: TextInputType.number,
+                      ),
+                    ),
                   ],
                 ),
                 const SizedBox(height: 12),
                 Align(
                   alignment: Alignment.centerLeft,
-                  child: Text('位置模板（可选）',
-                      style: GoogleFonts.plusJakartaSans(
-                          fontWeight: FontWeight.w600,
-                          color: const Color(0xFF60708A))),
+                  child: Text(
+                    '位置模板（可选）',
+                    style: GoogleFonts.plusJakartaSans(
+                      fontWeight: FontWeight.w600,
+                      color: const Color(0xFF60708A),
+                    ),
+                  ),
                 ),
                 const SizedBox(height: 8),
                 TextField(
@@ -914,13 +1025,12 @@ class FavoriteLocationsPage extends ConsumerWidget {
                 const SizedBox(height: 8),
                 DropdownButtonFormField<String?>(
                   value: catId,
-                  decoration:
-                      const InputDecoration(labelText: '默认分类'),
+                  decoration: const InputDecoration(labelText: '默认分类'),
                   items: [
-                    const DropdownMenuItem(
-                        value: null, child: Text('不指定')),
-                    for (final cat in appCategories
-                        .where((c) => c.type == EntryType.expense))
+                    const DropdownMenuItem(value: null, child: Text('不指定')),
+                    for (final cat in appCategories.where(
+                      (c) => c.type == EntryType.expense,
+                    ))
                       DropdownMenuItem(
                         value: cat.id,
                         child: Row(
@@ -959,8 +1069,7 @@ class FavoriteLocationsPage extends ConsumerWidget {
                   defaultTitle: titleCtrl.text.trim().isEmpty
                       ? null
                       : titleCtrl.text.trim(),
-                  defaultAmount:
-                      double.tryParse(amountCtrl.text.trim()),
+                  defaultAmount: double.tryParse(amountCtrl.text.trim()),
                 );
                 if (isNew) {
                   controller.addFavoriteLocation(loc);
